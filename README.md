@@ -19,3 +19,17 @@ conda install -c conda-forge -y \
   jupyterlab=4.3.0
 conda install -c pytorch -y pytorch torchvision torchaudio cpuonly
 ```
+
+```
+# using venv // [venv] is the venv name
+
+python3 -m venv [venv]
+source [venv]/bin/activate  # macOS
+[venv]\Scripts\activate     # Windows
+
+pip install -r requirements.txt
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+# run the program
+python3 baseline_rnn_birds.py
+```
