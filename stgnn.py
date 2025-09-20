@@ -88,31 +88,18 @@ temporal_features = torch.tensor(
     unique_coords[["start_month_sin","start_month_cos","end_month_sin","end_month_cos"]].values,
     dtype=torch.float
 )
-
 # ---------------------------
-# Step 4. Build k-NN + trajectory-based edges with weights
+# Step 4. Build k-NN edges only
 # ---------------------------
 # k-NN edges
-knn = NearestNeighbors(n_neighbors=2)
+knn = NearestNeighbors(n_neighbors=5)
 knn.fit(coords_scaled)
 neighbors = knn.kneighbors_graph(coords_scaled).tocoo()
-knn_edges = torch.tensor([neighbors.row, neighbors.col], dtype=torch.long)
+edge_index = torch.tensor([neighbors.row, neighbors.col], dtype=torch.long)
 
-# Trajectory edges
-trajectory_edges = []
-for traj in trajectories:
-    for i in range(len(traj)-1):
-        trajectory_edges.append((traj[i], traj[i+1]))
-        trajectory_edges.append((traj[i+1], traj[i]))  # reverse edge
-traj_edges = torch.tensor(trajectory_edges, dtype=torch.long).t().contiguous()
+# Edge weights: all ones
+edge_weight = torch.ones(edge_index.size(1), device=edge_index.device)
 
-# Combine edges
-edge_index = torch.cat([knn_edges, traj_edges], dim=1)
-
-# Edge weights: 1 for k-NN, 100 for trajectory edges
-# Weight the trajectory edges higher than k-NN
-edge_weight = torch.ones(edge_index.size(1))
-edge_weight[-traj_edges.size(1):] = 100.0  # last edges = trajectory
 
 # ---------------------------
 # Step 5. Model definition (Bi-LSTM + Attention)
