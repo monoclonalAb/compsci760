@@ -4,7 +4,7 @@
 
 import os
 import numpy as np
-import pandas
+import pandas as pd
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.model_selection import train_test_split
 import torch
@@ -25,48 +25,44 @@ NUM_LAYERS = 1
 EPOCHS = 100
 LR = 1e-3
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+RANDOM_SEED = 42
 
 # -----------------------
 # Helpers
 # -----------------------
-def load_and_prepare(df):
-    # detect columns used in your spreadsheet
+def load_and_check_columns(df):
+    """
+    Validate required columns exist and return useful config values:
+      - names of lat/lon/next_lat/next_lon
+      - list of extra numeric features to use
+      - route column name to group by (if present)
+    """
     cur_lon = "GPS_xx"
     cur_lat = "GPS_yy"
     next_lon = "next_longitude"
     next_lat = "next_latitude"
-    species_col = "Bird species" if "Bird species" in df.columns else None
 
-    # check presence
+    # ensure required columns exist
     for c in (cur_lon, cur_lat, next_lon, next_lat):
         if c not in df.columns:
-            raise RuntimeError(f"Required column '{c}' not found in the sheet.")
+            raise RuntimeError(f"Required column '{c}' not found in the sheet. Columns: {df.columns.tolist()}")
 
-    # drop missing essential rows
-    df = df.dropna(subset=[cur_lon, cur_lat, next_lon, next_lat]).reset_index(drop=True)
-
-    # optional numeric features to add (feel free to extend)
+    # optional extras
     extra_feats = []
     if "route_progress" in df.columns:
         extra_feats.append("route_progress")
     if "cumulative_distance" in df.columns:
         extra_feats.append("cumulative_distance")
 
-    # Build feature and target arrays
-    X_coords = df[[cur_lat, cur_lon] + extra_feats].astype(float).values
-    Y_next = df[[next_lat, next_lon]].astype(float).values
-
-    # species encoding (optional)
-    if species_col:
-        le = LabelEncoder()
-        species_labels = le.fit_transform(df[species_col].astype(str).values)
-        num_species = len(le.classes_)
+    # choose route column
+    if "Migratory route codes" in df.columns:
+        route_col = "Migratory route codes"
+    elif "ID" in df.columns:
+        route_col = "ID"
     else:
-        le = None
-        species_labels = None
-        num_species = 0
+        route_col = None
 
-    return X_coords, Y_next, species_labels, le, num_species
+    return cur_lat, cur_lon, next_lat, next_lon, extra_feats, route_col
 
 # -----------------------
 # Dataset class
@@ -112,34 +108,170 @@ class BaselineLSTM(nn.Module):
         return loc, sp_logits
 
 # -----------------------
+# Utility: sliding windows per route
+# -----------------------
+def create_sliding_windows_per_route(df, route_col, lat_col, lon_col, seq_len=8, stride=1, extras=None, sort_col="route_progress"):
+    """
+    Build sliding windows within each route. Returns X (N, seq_len, feat_dim), Y (N,2), and meta list (route_id, start_idx).
+    """
+    X_list, Y_list, meta = [], [], []
+    for rid, g in df.groupby(route_col):
+        # sort by time/order if column exists
+        if sort_col in g.columns:
+            g = g.sort_values(sort_col)
+        else:
+            g = g.sort_index()
+        coords = g[[lat_col, lon_col]].values  # (L,2)
+        extras_arr = g[extras].values if extras else None
+        L = coords.shape[0]
+        if L < seq_len + 1:
+            continue
+        for i in range(0, L - seq_len, stride):
+            seq_coords = coords[i:i+seq_len]  # (seq_len,2)
+            if extras_arr is not None:
+                seq_extras = extras_arr[i:i+seq_len]
+                seq = np.concatenate([seq_coords, seq_extras], axis=1)
+            else:
+                seq = seq_coords
+            target = coords[i+seq_len]  # next step
+            if np.isnan(seq).any() or np.isnan(target).any():
+                continue
+            X_list.append(seq)
+            Y_list.append(target)
+            meta.append((rid, i))
+    if len(X_list) == 0:
+        return None, None, None
+    X = np.stack(X_list, axis=0)
+    Y = np.stack(Y_list, axis=0)
+    return X, Y, meta
+
+# -----------------------
 # Main training flow
 # -----------------------
 def main():
-    df = pandas.read_excel(DATA_PATH)
-    X_coords, Y_next, species_labels, le, num_species = load_and_prepare(df)
+    np.random.seed(RANDOM_SEED)
+    df = pd.read_excel(DATA_PATH)
+    lat_col, lon_col, next_lat, next_lon, extra_feats, route_col = load_and_check_columns(df)
 
-    # scale features and targets (fit on whole dataset; if strict eval required, fit only on train)
-    feat_scaler = StandardScaler().fit(X_coords)
-    targ_scaler = StandardScaler().fit(Y_next)
-    X_scaled = feat_scaler.transform(X_coords)
-    Y_scaled = targ_scaler.transform(Y_next)
+    # basic cleaning: drop rows missing essential coordinates
+    df = df.dropna(subset=[lat_col, lon_col, next_lat, next_lon]).reset_index(drop=True)
 
-    N, feat_dim = X_scaled.shape[0], X_scaled.shape[1]
-    # reshape into sequences (SEQ_LEN), for single-step it's (N, 1, feat_dim)
-    X_seq = X_scaled.reshape(N, SEQ_LEN, feat_dim)
+    # If there is no explicit route column, create synthetic grouping by index blocks
+    if route_col is None:
+        # create pseudo routes by chunking index into blocks of size SEQ_LEN+1
+        block_size = max(SEQ_LEN+1, 10)
+        df["_route_tmp"] = (df.index // block_size).astype(int)
+        route_col = "_route_tmp"
 
-    # train/val split (stratify by species if available)
-    if species_labels is not None:
-        X_tr, X_val, ytr_loc, yval_loc, sp_tr, sp_val = train_test_split(
-            X_seq, Y_scaled, species_labels, test_size=0.2, random_state=42, stratify=species_labels)
+    # Grouped split by route ids (so entire trajectory belongs to one set)
+    route_ids = np.array(df[route_col].unique())
+    rng = np.random.default_rng(RANDOM_SEED)
+    rng.shuffle(route_ids)
+    n = len(route_ids)
+    train_frac, val_frac, test_frac = 0.7, 0.15, 0.15
+    n_train = int(np.floor(train_frac * n))
+    n_val = int(np.floor(val_frac * n))
+    train_ids = route_ids[:n_train]
+    val_ids = route_ids[n_train:n_train + n_val]
+    test_ids = route_ids[n_train + n_val:]
+
+    # assertions
+    assert len(set(train_ids) & set(val_ids)) == 0
+    assert len(set(train_ids) & set(test_ids)) == 0
+    assert len(set(val_ids) & set(test_ids)) == 0
+
+    train_df = df[df[route_col].isin(train_ids)].reset_index(drop=True)
+    val_df   = df[df[route_col].isin(val_ids)].reset_index(drop=True)
+    test_df  = df[df[route_col].isin(test_ids)].reset_index(drop=True)
+
+    print(f"Routes total={n}, train={len(train_ids)}, val={len(val_ids)}, test={len(test_ids)}")
+    print("Rows per split:", len(train_df), len(val_df), len(test_df))
+
+    # create sliding windows per split (within-route windows)
+    X_train, Y_train, meta_train = create_sliding_windows_per_route(train_df, route_col, lat_col, lon_col, seq_len=SEQ_LEN, extras=extra_feats)
+    X_val,   Y_val,   meta_val   = create_sliding_windows_per_route(val_df,   route_col, lat_col, lon_col, seq_len=SEQ_LEN, extras=extra_feats)
+    X_test,  Y_test,  meta_test  = create_sliding_windows_per_route(test_df,  route_col, lat_col, lon_col, seq_len=SEQ_LEN, extras=extra_feats)
+
+    # Fallback: if SEQ_LEN windows couldn't be created for any split, fall back to single-row mapping (row-level)
+    if X_train is None:
+        # Build row-wise features (current -> next) for train/val/test using the df splits
+        def rowwise_arrays(ddf):
+            Xr = ddf[[lat_col, lon_col] + extra_feats].astype(float).values
+            Yr = ddf[[next_lat, next_lon]].astype(float).values
+            return Xr, Yr
+        X_train, Y_train = rowwise_arrays(train_df)
+        X_val,   Y_val   = rowwise_arrays(val_df)
+        X_test,  Y_test  = rowwise_arrays(test_df)
+        # reshape to (N, 1, feat_dim)
+        X_train = X_train.reshape(X_train.shape[0], 1, X_train.shape[1])
+        X_val   = X_val.reshape(X_val.shape[0], 1, X_val.shape[1])
+        X_test  = X_test.reshape(X_test.shape[0], 1, X_test.shape[1])
+        meta_train = [(rid, idx) for idx, rid in enumerate(train_df[route_col].values)]
+        meta_val = [(rid, idx) for idx, rid in enumerate(val_df[route_col].values)]
+        meta_test = [(rid, idx) for idx, rid in enumerate(test_df[route_col].values)]
+
+    print("Sequence shapes (train/val/test):", 
+          None if X_train is None else X_train.shape, 
+          None if X_val is None else X_val.shape,
+          None if X_test is None else X_test.shape)
+
+    # Fit scalers on TRAIN only (no leakage)
+    feat_dim = X_train.shape[2]
+    feat_scaler = StandardScaler().fit(X_train.reshape(-1, feat_dim))
+    targ_scaler = StandardScaler().fit(Y_train)
+
+    X_train_s = feat_scaler.transform(X_train.reshape(-1, feat_dim)).reshape(X_train.shape)
+    X_val_s   = feat_scaler.transform(X_val.reshape(-1, feat_dim)).reshape(X_val.shape)
+    X_test_s  = feat_scaler.transform(X_test.reshape(-1, feat_dim)).reshape(X_test.shape)
+
+    Y_train_s = targ_scaler.transform(Y_train)
+    Y_val_s   = targ_scaler.transform(Y_val)
+    Y_test_s  = targ_scaler.transform(Y_test)
+
+    # Species encoding: fit on full df to avoid missing labels in val/test (alternatively fit on train and handle unseen)
+    species_col = "Bird species" if "Bird species" in df.columns else None
+    if species_col:
+        le = LabelEncoder()
+        le.fit(df[species_col].astype(str).values)  # fit on all species present (not numeric leakage)
+        # produce species labels per sequence by taking the mode species for that route in the corresponding split
+        def build_species_for_meta(meta_list, split_df):
+            species_for_seq = []
+            # create mapping route -> mode species for this split
+            route_to_species = split_df.groupby(route_col)[species_col].agg(lambda s: s.mode().iloc[0] if len(s.mode())>0 else s.iloc[0]).to_dict()
+            for rid, _ in meta_list:
+                sp = route_to_species.get(rid, None)
+                if sp is None:
+                    # fallback: use global mode (should be rare)
+                    species_for_seq.append(-1)
+                else:
+                    species_for_seq.append(int(le.transform([str(sp)])[0]))
+            return np.array(species_for_seq, dtype=np.int64)
+
+        sp_train = build_species_for_meta(meta_train, train_df)
+        sp_val   = build_species_for_meta(meta_val, val_df)
+        sp_test  = build_species_for_meta(meta_test, test_df)
+
+        # If any -1 (missing mapping), set to most common class index (safe fallback)
+        if (sp_train == -1).any() or (sp_val == -1).any() or (sp_test == -1).any():
+            most_common = int(le.transform([df[species_col].mode().iloc[0]])[0])
+            sp_train[sp_train == -1] = most_common
+            sp_val[sp_val == -1] = most_common
+            sp_test[sp_test == -1] = most_common
+
+        num_species = len(le.classes_)
     else:
-        X_tr, X_val, ytr_loc, yval_loc = train_test_split(X_seq, Y_scaled, test_size=0.2, random_state=42)
-        sp_tr = sp_val = None
+        le = None
+        sp_train = sp_val = sp_test = None
+        num_species = 0
 
-    train_ds = TrajStepDataset(X_tr, ytr_loc, sp_tr)
-    val_ds = TrajStepDataset(X_val, yval_loc, sp_val)
+    # Build datasets and loaders
+    train_ds = TrajStepDataset(X_train_s, Y_train_s, sp_train)
+    val_ds = TrajStepDataset(X_val_s, Y_val_s, sp_val)
+    test_ds = TrajStepDataset(X_test_s, Y_test_s, sp_test)
+
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
+    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
 
     # build model
     model = BaselineLSTM(feat_dim, hidden_size=HIDDEN_SIZE, num_layers=NUM_LAYERS, num_species=num_species).to(DEVICE)
@@ -211,7 +343,6 @@ def main():
     pred_loc = pred_loc.cpu().numpy()
     pred_unscaled = targ_scaler.inverse_transform(pred_loc)
     true_unscaled = targ_scaler.inverse_transform(ylocb.numpy())
-    import pandas as pd
     preview = pd.DataFrame({
         "pred_lat": pred_unscaled[:,0][:5],
         "pred_lon": pred_unscaled[:,1][:5],
