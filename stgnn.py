@@ -20,6 +20,7 @@ unique_coords["node_id"] = range(len(unique_coords))
 coord_to_id = {(r["GPS_xx"], r["GPS_yy"]): r["node_id"] for _, r in unique_coords.iterrows()}
 df["node_id"] = df.apply(lambda r: coord_to_id[(r["GPS_xx"], r["GPS_yy"])], axis=1).astype(int)
 
+
 # Trajectories
 trajectories = df.groupby("Migratory route codes")["node_id"].apply(list).tolist()
 
@@ -38,6 +39,18 @@ def build_training_pairs(trajectories, min_len=2):
 pairs = build_training_pairs(trajectories)
 num_nodes = len(unique_coords)
 print("Training pairs:", len(pairs), "| Unique nodes:", num_nodes)
+
+# Temporal aspect
+# Map start and end months from df
+start_month_map = df.groupby(["GPS_xx", "GPS_yy"])["Migration start month"].first().to_dict()
+end_month_map   = df.groupby(["GPS_xx", "GPS_yy"])["Migration end month"].first().to_dict()
+
+unique_coords["start_month"] = unique_coords.apply(
+    lambda r: start_month_map.get((r["GPS_xx"], r["GPS_yy"]), 1), axis=1
+)
+unique_coords["end_month"] = unique_coords.apply(
+    lambda r: end_month_map.get((r["GPS_xx"], r["GPS_yy"]), 1), axis=1
+)
 
 # ---------------------------
 # Step 2. Dataset + Dataloader
@@ -73,10 +86,6 @@ test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, collate_fn=
 scaler = StandardScaler()
 coords_scaled = scaler.fit_transform(unique_coords[["GPS_xx", "GPS_yy"]].values)
 x_coords = torch.tensor(coords_scaled, dtype=torch.float)
-
-# Temporal features (replace with actual columns)
-unique_coords["start_month"] = np.random.randint(1,13,size=num_nodes)
-unique_coords["end_month"] = np.random.randint(1,13,size=num_nodes)
 
 # Cyclic encoding
 unique_coords["start_month_sin"] = np.sin(2*np.pi*unique_coords["start_month"]/12)
