@@ -1,23 +1,19 @@
 """
-lgb_next_location.py
+lgb_next_location_haversine_per_iter.py
 
 LightGBM baseline for predicting next GPS coordinate (latitude, longitude)
-from current position + simple features.
-
-Requirements:
-  pip install pandas numpy scikit-learn lightgbm joblib
+with per-iteration Haversine RMSE (meters) evaluation & plotting.
 """
-
 import os
 import math
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import mean_squared_error
-from sklearn.model_selection import train_test_split
 import lightgbm as lgb
 import joblib
 from typing import Tuple
+import matplotlib.pyplot as plt
 
 # --------- CONFIG ----------
 DATA_PATH = "./data/processed_bird_migration.xlsx"   # change if needed
@@ -107,11 +103,11 @@ def main():
 
     # Optional: remove extreme jumps (outliers) — filter by step distance quantile
     step_dist_km = haversine_meters(df[lat_col].values, df[lon_col].values, df[next_lat].values, df[next_lon].values) / 1000.0
-    q95 = np.quantile(step_dist_km, 0.995)    # tune this if needed
-    mask = step_dist_km <= q95
+    q995 = np.quantile(step_dist_km, 0.995)
+    mask = step_dist_km <= q995
     removed = (~mask).sum()
     if removed > 0:
-        print(f"Removing {removed} extreme steps > 99.5 percentile (~{q95:.3f} km)")
+        print(f"Removing {removed} extreme steps > 99.5 percentile (~{q995:.3f} km)")
         df = df[mask].reset_index(drop=True)
 
     # route column
@@ -141,12 +137,10 @@ def main():
         extra_feats.append("route_progress")
     if "cumulative_distance" in df.columns:
         extra_feats.append("cumulative_distance")
-    # Add time features if present
     if "timestamp" in df.columns:
-        # ensure timestamp is datetime
         df["timestamp"] = pd.to_datetime(df["timestamp"])
         extra_feats.append("timestamp")
-    # For simplicity, we'll use: lat, lon, extra numeric features, species if available
+
     def build_features(ddf: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
         feats = []
         feats.append(ddf[lat_col].astype(float).values.reshape(-1, 1))
@@ -156,7 +150,6 @@ def main():
         if "cumulative_distance" in extra_feats:
             feats.append(ddf["cumulative_distance"].astype(float).values.reshape(-1,1))
         if "timestamp" in extra_feats:
-            # encode day-of-year cyclical features
             ts = pd.to_datetime(ddf["timestamp"])
             doy = ts.dt.dayofyear.values
             feats.append(np.sin(2*np.pi*doy/365).reshape(-1,1))
@@ -180,74 +173,130 @@ def main():
     print("Feature dim:", X_train.shape[1])
     print("Train samples:", X_train.shape[0], "Val:", X_val.shape[0], "Test:", X_test.shape[0])
 
-    # 4) Train two LightGBM regressors (lat and lon) with early stopping
+    # 4) Train two LightGBM regressors (lat and lon) with early stopping and record evals
     models = {}
+    evals_results = {}
     for dim_idx, dim_name in enumerate(["next_latitude", "next_longitude"]):
         print(f"\nTraining LightGBM for target: {dim_name} (index {dim_idx})")
         train_set = lgb.Dataset(X_train, label=Y_train[:, dim_idx])
         val_set = lgb.Dataset(X_val, label=Y_val[:, dim_idx], reference=train_set)
+        test_set = lgb.Dataset(X_test, label=Y_test[:, dim_idx], reference=train_set)
+
         params = LGB_PARAMS.copy()
-        # callback
-        callbacks = []
-        # early stopping via callback
-        callbacks.append(lgb.early_stopping(stopping_rounds=EARLY_STOPPING_ROUNDS, verbose=True))
-        # periodic logging (prints evaluation every 50 rounds)
-        callbacks.append(lgb.log_evaluation(period=50))
-        # fit
+
+        # prepare an empty dict to be filled by record_evaluation callback
+        evals_result = {}
+
+        callbacks = [
+            lgb.early_stopping(stopping_rounds=EARLY_STOPPING_ROUNDS, verbose=True),
+            lgb.log_evaluation(period=50),
+            lgb.record_evaluation(evals_result),
+        ]
+
         gbm = lgb.train(params,
                         train_set,
                         num_boost_round=N_ESTIMATORS,
-                        valid_sets=[train_set, val_set],
-                        valid_names=['train','val'],
+                        valid_sets=[train_set, val_set, test_set],
+                        valid_names=['train', 'val', 'test'],
                         callbacks=callbacks)
+
         models[dim_name] = gbm
-        # save model
+        evals_results[dim_name] = evals_result
+
         model_path = os.path.join(OUT_DIR, f"lgb_{dim_name}.txt")
         gbm.save_model(model_path)
         print("Saved model to:", model_path)
 
-    # 5) Predict on test set
-    print("\nPredicting on test set...")
-    pred_lat = models["next_latitude"].predict(X_test, num_iteration=models["next_latitude"].best_iteration)
-    pred_lon = models["next_longitude"].predict(X_test, num_iteration=models["next_longitude"].best_iteration)
+    # 5) Compute per-iteration haversine RMSE (meters) for val & test
+    # Determine number of iterations available for each model
+    def safe_num_iters(gbm):
+        # prefer best_iteration if early stopping happened, else num_trees
+        if getattr(gbm, "best_iteration", None):
+            return int(gbm.best_iteration)
+        try:
+            return int(gbm.num_trees())
+        except Exception:
+            return int(N_ESTIMATORS)
 
-    # Compute haversine error
+    n_iter_lat = safe_num_iters(models["next_latitude"])
+    n_iter_lon = safe_num_iters(models["next_longitude"])
+    n_common = min(n_iter_lat, n_iter_lon)
+    if n_common <= 0:
+        print("No iterations found for both models; skipping per-iteration haversine computation.")
+    else:
+        print(f"Computing haversine RMSE for iterations 1..{n_common} (this will predict on val & test each iteration)...")
+        val_rmse_per_iter = []
+        test_rmse_per_iter = []
+
+        # loop iterations; predict with num_iteration=i for both models
+        for i in range(1, n_common + 1):
+            # predict val
+            pred_lat_val = models["next_latitude"].predict(X_val, num_iteration=i)
+            pred_lon_val = models["next_longitude"].predict(X_val, num_iteration=i)
+            d_val = haversine_meters(Y_val[:,0], Y_val[:,1], pred_lat_val, pred_lon_val)
+            rmse_val = float(np.sqrt(np.mean(d_val**2)))
+            val_rmse_per_iter.append(rmse_val)
+
+            # predict test
+            pred_lat_test = models["next_latitude"].predict(X_test, num_iteration=i)
+            pred_lon_test = models["next_longitude"].predict(X_test, num_iteration=i)
+            d_test = haversine_meters(Y_test[:,0], Y_test[:,1], pred_lat_test, pred_lon_test)
+            rmse_test = float(np.sqrt(np.mean(d_test**2)))
+            test_rmse_per_iter.append(rmse_test)
+
+            if (i % 50 == 0) or (i == 1) or (i == n_common):
+                print(f" iter {i:04d}: val_haversine_rmse = {rmse_val:.2f} m, test_haversine_rmse = {rmse_test:.2f} m")
+
+        val_rmse_per_iter = np.array(val_rmse_per_iter, dtype=float)
+        test_rmse_per_iter = np.array(test_rmse_per_iter, dtype=float)
+
+        # 6) Plot haversine RMSE per iteration
+        plt.figure(figsize=(10,5))
+        iters = np.arange(1, n_common + 1)
+        plt.plot(iters, val_rmse_per_iter, label='Val Haversine RMSE (m)', marker='o')
+        plt.plot(iters, test_rmse_per_iter, label='Test Haversine RMSE (m)', marker='x')
+        plt.xlabel('Boosting iteration')
+        plt.ylabel('Haversine RMSE (meters)')
+        plt.title('Haversine RMSE per boosting iteration')
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        out_plot = os.path.join(OUT_DIR, "haversine_rmse_per_iter.png")
+        plt.savefig(out_plot, dpi=150)
+        plt.close()
+        print("Saved haversine RMSE plot to:", out_plot)
+
+        # Save CSV
+        df_iters = pd.DataFrame({
+            "iter": iters,
+            "val_haversine_rmse_m": val_rmse_per_iter,
+            "test_haversine_rmse_m": test_rmse_per_iter
+        })
+        csv_out = os.path.join(OUT_DIR, "haversine_rmse_per_iter.csv")
+        df_iters.to_csv(csv_out, index=False)
+        print("Saved per-iteration haversine RMSE CSV to:", csv_out)
+
+    # 7) Final predictions on test set using best_iteration for each model and final haversine metrics
+    pred_lat = models["next_latitude"].predict(X_test, num_iteration=models["next_latitude"].best_iteration if getattr(models["next_latitude"], "best_iteration", None) else None)
+    pred_lon = models["next_longitude"].predict(X_test, num_iteration=models["next_longitude"].best_iteration if getattr(models["next_longitude"], "best_iteration", None) else None)
+
     metrics = regression_metrics_haversine(Y_test[:,0], Y_test[:,1], pred_lat, pred_lon)
-    print("\nTest Haversine metrics (meters):")
+    print("\nFinal Test Haversine metrics (meters) using best_iteration:")
     for k,v in metrics.items():
         print(f"  {k}: {v:.3f}")
 
     # Also print coordinate RMSE (degrees) for interest
     lat_mse = mean_squared_error(Y_test[:,0], pred_lat)
     lon_mse = mean_squared_error(Y_test[:,1], pred_lon)
-    print(f"\nCoordinate-space RMSE (deg): lat {math.sqrt(lat_mse):.6f}, lon {math.sqrt(lon_mse):.6f}")
-
-    # 6) Feature importance (gain) from one model (lat); show top features
-    try:
-        feat_names = ["lat","lon"]
-        if "route_progress" in extra_feats: feat_names.append("route_progress")
-        if "cumulative_distance" in extra_feats: feat_names.append("cumulative_distance")
-        if "timestamp" in extra_feats:
-            feat_names.extend(["doy_sin","doy_cos"])
-        if use_species: feat_names.append("__species_le")
-        # If dimensions mismatch, trim/pad
-        if len(feat_names) != X_train.shape[1]:
-            # fallback: generic names
-            feat_names = [f"f{i}" for i in range(X_train.shape[1])]
-    except Exception:
-        feat_names = [f"f{i}" for i in range(X_train.shape[1])]
-
-    print("\nTop feature importances (by gain) for next_latitude:")
-    imp = models["next_latitude"].feature_importance(importance_type="gain")
-    idx_sorted = np.argsort(-imp)[:20]
-    for i in idx_sorted:
-        print(f"  {feat_names[i]:20s}  gain={imp[i]:.3f}")
+    combined_mse_final = (lat_mse + lon_mse) / 2.0
+    print(f"\nFinal coordinate-space RMSE (deg): lat {math.sqrt(lat_mse):.6f}, lon {math.sqrt(lon_mse):.6f}")
+    print(f"Final combined RMSE (deg): {math.sqrt(combined_mse_final):.6f}")
 
     # Save models (joblib wrapper)
     joblib.dump(models, os.path.join(OUT_DIR, "lgb_models.pkl"))
     print("Saved LightGBM models (joblib).")
 
-    # Save a small results summary CSV
+    # Save test-level predictions CSV
     summary_df = pd.DataFrame({
         "true_lat": Y_test[:,0],
         "true_lon": Y_test[:,1],
