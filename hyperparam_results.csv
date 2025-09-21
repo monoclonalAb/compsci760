@@ -1,0 +1,25 @@
+config,val_top1
+"{'k': 3, 'gcn_hidden': 32, 'emb_dim': 64, 'dropout': 0.2}",0.4241379310344828
+"{'k': 3, 'gcn_hidden': 32, 'emb_dim': 64, 'dropout': 0.5}",0.3413793103448276
+"{'k': 3, 'gcn_hidden': 32, 'emb_dim': 128, 'dropout': 0.2}",0.45517241379310347
+"{'k': 3, 'gcn_hidden': 32, 'emb_dim': 128, 'dropout': 0.5}",0.3724137931034483
+"{'k': 3, 'gcn_hidden': 64, 'emb_dim': 64, 'dropout': 0.2}",0.4379310344827586
+"{'k': 3, 'gcn_hidden': 64, 'emb_dim': 64, 'dropout': 0.5}",0.3758620689655172
+"{'k': 3, 'gcn_hidden': 64, 'emb_dim': 128, 'dropout': 0.2}",0.4827586206896552
+"{'k': 3, 'gcn_hidden': 64, 'emb_dim': 128, 'dropout': 0.5}",0.3896551724137931
+"{'k': 5, 'gcn_hidden': 32, 'emb_dim': 64, 'dropout': 0.2}",0.4
+"{'k': 5, 'gcn_hidden': 32, 'emb_dim': 64, 'dropout': 0.5}",0.3482758620689655
+"{'k': 5, 'gcn_hidden': 32, 'emb_dim': 128, 'dropout': 0.2}",0.45517241379310347
+"{'k': 5, 'gcn_hidden': 32, 'emb_dim': 128, 'dropout': 0.5}",0.3793103448275862
+"{'k': 5, 'gcn_hidden': 64, 'emb_dim': 64, 'dropout': 0.2}",0.43103448275862066
+"{'k': 5, 'gcn_hidden': 64, 'emb_dim': 64, 'dropout': 0.5}",0.3413793103448276
+"{'k': 5, 'gcn_hidden': 64, 'emb_dim': 128, 'dropout': 0.2}",0.4482758620689655
+"{'k': 5, 'gcn_hidden': 64, 'emb_dim': 128, 'dropout': 0.5}",0.38275862068965516
+"{'k': 7, 'gcn_hidden': 32, 'emb_dim': 64, 'dropout': 0.2}",0.3793103448275862
+"{'k': 7, 'gcn_hidden': 32, 'emb_dim': 64, 'dropout': 0.5}",0.31724137931034485
+"{'k': 7, 'gcn_hidden': 32, 'emb_dim': 128, 'dropout': 0.2}",0.4517241379310345
+"{'k': 7, 'gcn_hidden': 32, 'emb_dim': 128, 'dropout': 0.5}",0.3482758620689655
+"{'k': 7, 'gcn_hidden': 64, 'emb_dim': 64, 'dropout': 0.2}",0.38275862068965516
+"{'k': 7, 'gcn_hidden': 64, 'emb_dim': 64, 'dropout': 0.5}",0.3793103448275862
+"{'k': 7, 'gcn_hidden': 64, 'emb_dim': 128, 'dropout': 0.2}",0.41724137931034483
+"{'k': 7, 'gcn_hidden': 64, 'emb_dim': 128, 'dropout': 0.5}",0.3689655172413793
