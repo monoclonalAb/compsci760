@@ -6,6 +6,7 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.neighbors import NearestNeighbors
+from src.preprocessing import haversine
 import pandas as pd
 import numpy as np
 import json
@@ -20,6 +21,8 @@ unique_coords = df[["GPS_xx", "GPS_yy"]].drop_duplicates().reset_index(drop=True
 unique_coords["node_id"] = range(len(unique_coords))
 coord_to_id = {(r["GPS_xx"], r["GPS_yy"]): r["node_id"] for _, r in unique_coords.iterrows()}
 df["node_id"] = df.apply(lambda r: coord_to_id[(r["GPS_xx"], r["GPS_yy"])], axis=1).astype(int)
+
+coords_raw = unique_coords[["GPS_xx", "GPS_yy"]].values  # Store coordinates before scaling for distance calculations
 
 # Trajectories
 trajectories = df.groupby("Migratory route codes")["node_id"].apply(list).tolist()
@@ -179,7 +182,7 @@ def train_epoch(model, loader, optimizer, edge_index, edge_weight):
 @torch.no_grad()
 def evaluate(model, loader, edge_index, edge_weight, k=5):
     model.eval()
-    total, correct1, correctk, mse_total = 0, 0, 0, 0.0
+    total, correct1, correctk, mse_total, haversine_total = 0, 0, 0, 0.0, 0.0
     for seq, lengths, target in loader:
         seq, lengths, target = seq.to(device), lengths.to(device), target.to(device)
         out = model(x_coords, edge_index, seq, lengths, temporal_features, edge_weight=edge_weight)
@@ -190,8 +193,17 @@ def evaluate(model, loader, edge_index, edge_weight, k=5):
             if target[i] in topk[i]:
                 correctk += 1
         mse_total += F.mse_loss(x_coords[pred_top1], x_coords[target], reduction='sum').item()
+        
+        # Haversine evaluation
+        for i in range(len(target)):
+            true_node = target[i].item()
+            pred_node = pred_top1[i].item()
+            pred_coord = coords_raw[pred_node]
+            true_coord = coords_raw[true_node]
+            haversine_total += haversine(pred_coord[0], pred_coord[1], true_coord[0], true_coord[1])
+        
         total += len(target)
-    return correct1/total, correctk/total, mse_total/total
+    return correct1/total, correctk/total, mse_total/total, haversine_total/total
 
 # ---------------------------
 # Step 7. Training with validation + hyperparam tuning
@@ -221,7 +233,7 @@ def train_model(config, max_epochs=50, patience=10):
 
     for epoch in range(max_epochs):
         loss = train_epoch(model, train_loader, optimizer, edge_index, edge_weight)
-        top1_val, top5_val, mse_val = evaluate(model, val_loader, edge_index, edge_weight, k=5)
+        top1_val, top5_val, mse_val, haversine_val = evaluate(model, val_loader, edge_index, edge_weight, k=5)
 
         if top1_val > best_val_top1:
             best_val_top1 = top1_val
@@ -234,7 +246,7 @@ def train_model(config, max_epochs=50, patience=10):
                 break
 
         print(f"Epoch {epoch+1} | Train Loss {loss:.4f} | "
-              f"Val Top-1 {top1_val:.3f} | Val Top-5 {top5_val:.3f} | Val MSE {mse_val:.4f}")
+              f"Val Top-1 {top1_val:.3f} | Val Top-5 {top5_val:.3f} | Val MSE {mse_val:.4f} | Val Haversine {haversine_val:.4f} km")
 
     return best_val_top1, best_model_state, edge_index, edge_weight
 
@@ -282,6 +294,6 @@ final_model = GCN_BiLSTM_Attn_Temporal(
 ).to(device)
 final_model.load_state_dict(best_state)
 
-top1_test, top5_test, mse_test = evaluate(final_model, test_loader, best_edge_index, best_edge_weight, k=5)
+top1_test, top5_test, mse_test, haversine_test = evaluate(final_model, test_loader, best_edge_index, best_edge_weight, k=5)
 print(f"\nTest Results with {dict(best_cfg)}: "
-      f"Top-1 {top1_test:.3f} | Top-5 {top5_test:.3f} | MSE {mse_test:.4f}")
+      f"Top-1 {top1_test:.3f} | Top-5 {top5_test:.3f} | MSE {mse_test:.4f} | Haversine {haversine_test:.4f} km")
