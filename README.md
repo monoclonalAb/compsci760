@@ -16,7 +16,8 @@ conda install -c conda-forge -y \
   openpyxl=3.1.2 \
   matplotlib=3.8.0 \
   nbformat=5.9.2 \
-  jupyterlab=4.3.0
+  jupyterlab=4.3.0 \
+  lightgbm=4.0.0
 conda install -c pytorch -y pytorch torchvision torchaudio cpuonly
 ```
 
