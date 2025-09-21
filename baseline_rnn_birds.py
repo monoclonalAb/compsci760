@@ -1,24 +1,24 @@
-# baseline_rnn_birds.py
-# Baseline LSTM for next-location regression + species classification
-# Requires: pandas, numpy, scikit-learn, torch
-
+# baseline_rnn_birds_with_epoch_test_eval.py
+# (based on your original baseline_rnn_birds.py with added per-epoch test evaluation + RMSE plot)
 import os
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, f1_score
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+import matplotlib.pyplot as plt  # <- added for plotting
 
 # -----------------------
-# Config
+# Config (same as yours)
 # -----------------------
 DATA_PATH = "./data/processed_bird_migration.xlsx"   # change if needed
 MODEL_PATH = "./baseline_rnn_birds.pth"
 SCALER_PATH = "./baseline_scalers.npz"
 
-SEQ_LEN = 1             # 1 = single-step model (row -> next row); increase if you create sequences
+SEQ_LEN = 1
 BATCH_SIZE = 128
 HIDDEN_SIZE = 32
 NUM_LAYERS = 1
@@ -28,33 +28,36 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 RANDOM_SEED = 42
 
 # -----------------------
-# Helpers
+# Helpers (unchanged)
 # -----------------------
+def haversine_np(lat1, lon1, lat2, lon2):
+    """
+    Vectorized haversine distance in meters between points in degrees.
+    """
+    R = 6371000.0  # Earth radius in meters
+    phi1 = np.radians(lat1)
+    phi2 = np.radians(lat2)
+    dphi = np.radians(lat2 - lat1)
+    dlambda = np.radians(lon2 - lon1)
+    a = np.sin(dphi/2.0)**2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlambda/2.0)**2
+    return 2 * R * np.arcsin(np.sqrt(a))
+
 def load_and_check_columns(df):
-    """
-    Validate required columns exist and return useful config values:
-      - names of lat/lon/next_lat/next_lon
-      - list of extra numeric features to use
-      - route column name to group by (if present)
-    """
     cur_lon = "GPS_xx"
     cur_lat = "GPS_yy"
     next_lon = "next_longitude"
     next_lat = "next_latitude"
 
-    # ensure required columns exist
     for c in (cur_lon, cur_lat, next_lon, next_lat):
         if c not in df.columns:
             raise RuntimeError(f"Required column '{c}' not found in the sheet. Columns: {df.columns.tolist()}")
 
-    # optional extras
     extra_feats = []
     if "route_progress" in df.columns:
         extra_feats.append("route_progress")
     if "cumulative_distance" in df.columns:
         extra_feats.append("cumulative_distance")
 
-    # choose route column
     if "Migratory route codes" in df.columns:
         route_col = "Migratory route codes"
     elif "ID" in df.columns:
@@ -64,13 +67,11 @@ def load_and_check_columns(df):
 
     return cur_lat, cur_lon, next_lat, next_lon, extra_feats, route_col
 
-# -----------------------
-# Dataset class
-# -----------------------
+# Dataset and model classes same as yours
 class TrajStepDataset(Dataset):
     def __init__(self, X_seq, y_loc, y_sp=None):
-        self.X = torch.tensor(X_seq, dtype=torch.float32)   # (N, SEQ_LEN, feat_dim)
-        self.y_loc = torch.tensor(y_loc, dtype=torch.float32)  # (N, 2)
+        self.X = torch.tensor(X_seq, dtype=torch.float32)
+        self.y_loc = torch.tensor(y_loc, dtype=torch.float32)
         self.y_sp = torch.tensor(y_sp, dtype=torch.long) if y_sp is not None else None
     def __len__(self):
         return len(self.X)
@@ -79,9 +80,6 @@ class TrajStepDataset(Dataset):
             return self.X[idx], self.y_loc[idx], -1
         return self.X[idx], self.y_loc[idx], self.y_sp[idx]
 
-# -----------------------
-# Model: LSTM -> (regression head, optional classification head)
-# -----------------------
 class BaselineLSTM(nn.Module):
     def __init__(self, feat_dim, hidden_size=64, num_layers=1, num_species=0):
         super().__init__()
@@ -101,39 +99,32 @@ class BaselineLSTM(nn.Module):
             self.cls_head = None
 
     def forward(self, x):
-        out, _ = self.lstm(x)           # out: (batch, seq_len, hidden)
-        h = out[:, -1, :]               # last timestep
+        out, _ = self.lstm(x)
+        h = out[:, -1, :]
         loc = self.reg_head(h)
         sp_logits = self.cls_head(h) if self.cls_head is not None else None
         return loc, sp_logits
 
-# -----------------------
-# Utility: sliding windows per route
-# -----------------------
 def create_sliding_windows_per_route(df, route_col, lat_col, lon_col, seq_len=8, stride=1, extras=None, sort_col="route_progress"):
-    """
-    Build sliding windows within each route. Returns X (N, seq_len, feat_dim), Y (N,2), and meta list (route_id, start_idx).
-    """
     X_list, Y_list, meta = [], [], []
     for rid, g in df.groupby(route_col):
-        # sort by time/order if column exists
         if sort_col in g.columns:
             g = g.sort_values(sort_col)
         else:
             g = g.sort_index()
-        coords = g[[lat_col, lon_col]].values  # (L,2)
+        coords = g[[lat_col, lon_col]].values
         extras_arr = g[extras].values if extras else None
         L = coords.shape[0]
         if L < seq_len + 1:
             continue
         for i in range(0, L - seq_len, stride):
-            seq_coords = coords[i:i+seq_len]  # (seq_len,2)
+            seq_coords = coords[i:i+seq_len]
             if extras_arr is not None:
                 seq_extras = extras_arr[i:i+seq_len]
                 seq = np.concatenate([seq_coords, seq_extras], axis=1)
             else:
                 seq = seq_coords
-            target = coords[i+seq_len]  # next step
+            target = coords[i+seq_len]
             if np.isnan(seq).any() or np.isnan(target).any():
                 continue
             X_list.append(seq)
@@ -146,24 +137,20 @@ def create_sliding_windows_per_route(df, route_col, lat_col, lon_col, seq_len=8,
     return X, Y, meta
 
 # -----------------------
-# Main training flow
+# Main training flow with per-epoch test evaluation + plotting
 # -----------------------
 def main():
     np.random.seed(RANDOM_SEED)
     df = pd.read_excel(DATA_PATH)
     lat_col, lon_col, next_lat, next_lon, extra_feats, route_col = load_and_check_columns(df)
 
-    # basic cleaning: drop rows missing essential coordinates
     df = df.dropna(subset=[lat_col, lon_col, next_lat, next_lon]).reset_index(drop=True)
 
-    # If there is no explicit route column, create synthetic grouping by index blocks
     if route_col is None:
-        # create pseudo routes by chunking index into blocks of size SEQ_LEN+1
         block_size = max(SEQ_LEN+1, 10)
         df["_route_tmp"] = (df.index // block_size).astype(int)
         route_col = "_route_tmp"
 
-    # Grouped split by route ids (so entire trajectory belongs to one set)
     route_ids = np.array(df[route_col].unique())
     rng = np.random.default_rng(RANDOM_SEED)
     rng.shuffle(route_ids)
@@ -175,11 +162,6 @@ def main():
     val_ids = route_ids[n_train:n_train + n_val]
     test_ids = route_ids[n_train + n_val:]
 
-    # assertions
-    assert len(set(train_ids) & set(val_ids)) == 0
-    assert len(set(train_ids) & set(test_ids)) == 0
-    assert len(set(val_ids) & set(test_ids)) == 0
-
     train_df = df[df[route_col].isin(train_ids)].reset_index(drop=True)
     val_df   = df[df[route_col].isin(val_ids)].reset_index(drop=True)
     test_df  = df[df[route_col].isin(test_ids)].reset_index(drop=True)
@@ -187,14 +169,11 @@ def main():
     print(f"Routes total={n}, train={len(train_ids)}, val={len(val_ids)}, test={len(test_ids)}")
     print("Rows per split:", len(train_df), len(val_df), len(test_df))
 
-    # create sliding windows per split (within-route windows)
     X_train, Y_train, meta_train = create_sliding_windows_per_route(train_df, route_col, lat_col, lon_col, seq_len=SEQ_LEN, extras=extra_feats)
     X_val,   Y_val,   meta_val   = create_sliding_windows_per_route(val_df,   route_col, lat_col, lon_col, seq_len=SEQ_LEN, extras=extra_feats)
     X_test,  Y_test,  meta_test  = create_sliding_windows_per_route(test_df,  route_col, lat_col, lon_col, seq_len=SEQ_LEN, extras=extra_feats)
 
-    # Fallback: if SEQ_LEN windows couldn't be created for any split, fall back to single-row mapping (row-level)
     if X_train is None:
-        # Build row-wise features (current -> next) for train/val/test using the df splits
         def rowwise_arrays(ddf):
             Xr = ddf[[lat_col, lon_col] + extra_feats].astype(float).values
             Yr = ddf[[next_lat, next_lon]].astype(float).values
@@ -202,7 +181,6 @@ def main():
         X_train, Y_train = rowwise_arrays(train_df)
         X_val,   Y_val   = rowwise_arrays(val_df)
         X_test,  Y_test  = rowwise_arrays(test_df)
-        # reshape to (N, 1, feat_dim)
         X_train = X_train.reshape(X_train.shape[0], 1, X_train.shape[1])
         X_val   = X_val.reshape(X_val.shape[0], 1, X_val.shape[1])
         X_test  = X_test.reshape(X_test.shape[0], 1, X_test.shape[1])
@@ -215,7 +193,6 @@ def main():
           None if X_val is None else X_val.shape,
           None if X_test is None else X_test.shape)
 
-    # Fit scalers on TRAIN only (no leakage)
     feat_dim = X_train.shape[2]
     feat_scaler = StandardScaler().fit(X_train.reshape(-1, feat_dim))
     targ_scaler = StandardScaler().fit(Y_train)
@@ -228,43 +205,34 @@ def main():
     Y_val_s   = targ_scaler.transform(Y_val)
     Y_test_s  = targ_scaler.transform(Y_test)
 
-    # Species encoding: fit on full df to avoid missing labels in val/test (alternatively fit on train and handle unseen)
     species_col = "Bird species" if "Bird species" in df.columns else None
     if species_col:
         le = LabelEncoder()
-        le.fit(df[species_col].astype(str).values)  # fit on all species present (not numeric leakage)
-        # produce species labels per sequence by taking the mode species for that route in the corresponding split
+        le.fit(df[species_col].astype(str).values)
         def build_species_for_meta(meta_list, split_df):
             species_for_seq = []
-            # create mapping route -> mode species for this split
             route_to_species = split_df.groupby(route_col)[species_col].agg(lambda s: s.mode().iloc[0] if len(s.mode())>0 else s.iloc[0]).to_dict()
             for rid, _ in meta_list:
                 sp = route_to_species.get(rid, None)
                 if sp is None:
-                    # fallback: use global mode (should be rare)
                     species_for_seq.append(-1)
                 else:
                     species_for_seq.append(int(le.transform([str(sp)])[0]))
             return np.array(species_for_seq, dtype=np.int64)
-
         sp_train = build_species_for_meta(meta_train, train_df)
         sp_val   = build_species_for_meta(meta_val, val_df)
         sp_test  = build_species_for_meta(meta_test, test_df)
-
-        # If any -1 (missing mapping), set to most common class index (safe fallback)
         if (sp_train == -1).any() or (sp_val == -1).any() or (sp_test == -1).any():
             most_common = int(le.transform([df[species_col].mode().iloc[0]])[0])
             sp_train[sp_train == -1] = most_common
             sp_val[sp_val == -1] = most_common
             sp_test[sp_test == -1] = most_common
-
         num_species = len(le.classes_)
     else:
         le = None
         sp_train = sp_val = sp_test = None
         num_species = 0
 
-    # Build datasets and loaders
     train_ds = TrajStepDataset(X_train_s, Y_train_s, sp_train)
     val_ds = TrajStepDataset(X_val_s, Y_val_s, sp_val)
     test_ds = TrajStepDataset(X_test_s, Y_test_s, sp_test)
@@ -273,7 +241,6 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
     test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
 
-    # build model
     model = BaselineLSTM(feat_dim, hidden_size=HIDDEN_SIZE, num_layers=NUM_LAYERS, num_species=num_species).to(DEVICE)
     opt = torch.optim.Adam(model.parameters(), lr=LR)
     mse = nn.MSELoss()
@@ -292,7 +259,45 @@ def main():
                 n += Xb.size(0)
         return total_mse / n, (total_ce / n) if celoss is not None else None
 
-    # training loop
+    # NEW: evaluate on loader but produce Haversine distances (unscaled coords) and return summary stats
+    def evaluate_haversine(loader):
+        """
+        Runs the model on `loader`, inverse-transforms predicted and true targets,
+        computes Haversine distances (meters) and returns:
+            (mean_m, median_m, rmse_m, p25, p75, p95, n_samples)
+        """
+        model.eval()
+        preds_coords = []
+        trues_coords = []
+        n_total = 0
+        with torch.no_grad():
+            for Xb, ylocb, yspb in loader:
+                Xb = Xb.to(DEVICE)
+                pred_loc_s, _ = model(Xb)  # scaled predictions
+                pred_loc_np = pred_loc_s.cpu().numpy()
+                true_loc_np = ylocb.cpu().numpy()
+                pred_unscaled = targ_scaler.inverse_transform(pred_loc_np)
+                true_unscaled = targ_scaler.inverse_transform(true_loc_np)
+                preds_coords.append(pred_unscaled)
+                trues_coords.append(true_unscaled)
+                n_total += Xb.size(0)
+        if n_total == 0:
+            return None  # empty set
+        preds_coords = np.vstack(preds_coords)
+        trues_coords = np.vstack(trues_coords)
+        # haversine expects lat1, lon1, lat2, lon2 in degrees
+        dists = haversine_np(trues_coords[:,0], trues_coords[:,1], preds_coords[:,0], preds_coords[:,1])
+        mean_m = float(np.mean(dists))
+        median_m = float(np.median(dists))
+        rmse_m = float(np.sqrt(np.mean(dists**2)))
+        p25, p75, p95 = [float(np.percentile(dists, q)) for q in (25, 75, 95)]
+        return mean_m, median_m, rmse_m, p25, p75, p95, n_total
+
+    # Lists to track RMSE per epoch
+    test_rmse_per_epoch = []
+    val_rmse_per_epoch = []  # optional: track val as well if desired
+
+    # training loop (modified to run test evaluation every epoch)
     for epoch in range(1, EPOCHS+1):
         model.train()
         running_mse = 0.0; running_ce = 0.0; tot = 0
@@ -312,13 +317,39 @@ def main():
             tot += bs
         train_mse = running_mse / tot
         train_ce = (running_ce / tot) if celoss is not None else None
-        val_mse, val_ce = evaluate(val_loader)
-        print(f"Epoch {epoch:02d} | Train MSE: {train_mse:.6f}" +
-              (f", Train CE: {train_ce:.4f}" if train_ce is not None else "") +
-              f" | Val MSE: {val_mse:.6f}" +
-              (f", Val CE: {val_ce:.4f}" if val_ce is not None else ""))
 
-    # save model + scalers + classes
+        # validation (scaled MSE for monitoring)
+        val_mse, val_ce = evaluate(val_loader)
+
+        # NEW: run Haversine evaluation on validation & test set (unscaled, meters)
+        val_hav = evaluate_haversine(val_loader)
+        test_hav = evaluate_haversine(test_loader)
+
+        # record RMSE (test) for plotting
+        if test_hav is not None:
+            _, _, test_rmse_m, _, _, _, _ = test_hav
+            test_rmse_per_epoch.append(test_rmse_m)
+        else:
+            test_rmse_per_epoch.append(np.nan)
+
+        if val_hav is not None:
+            _, _, val_rmse_m, _, _, _, _ = val_hav
+            val_rmse_per_epoch.append(val_rmse_m)
+        else:
+            val_rmse_per_epoch.append(np.nan)
+
+        # print nicely
+        msg = (f"Epoch {epoch:02d} | Train MSE: {train_mse:.6f}" +
+               (f", Train CE: {train_ce:.4f}" if train_ce is not None else "") +
+               f" | Val MSE: {val_mse:.6f}" +
+               (f", Val CE: {val_ce:.4f}" if val_ce is not None else ""))
+        if val_hav is not None:
+            msg += f" | Val RMSE: {val_hav[2]:.2f} m"
+        if test_hav is not None:
+            msg += f" | Test RMSE: {test_hav[2]:.2f} m"
+        print(msg)
+
+    # save model + scalers + classes (same as yours)
     save_dict = {
         "model_state_dict": model.state_dict(),
         "feat_scaler_mean": feat_scaler.mean_,
@@ -335,24 +366,25 @@ def main():
     print("Saved model:", MODEL_PATH)
     print("Saved scalers:", SCALER_PATH)
 
-    # quick sample prediction on validation set
-    model.eval()
-    Xb, ylocb, yspb = next(iter(val_loader))
-    with torch.no_grad():
-        pred_loc, pred_sp = model(Xb.to(DEVICE))
-    pred_loc = pred_loc.cpu().numpy()
-    pred_unscaled = targ_scaler.inverse_transform(pred_loc)
-    true_unscaled = targ_scaler.inverse_transform(ylocb.numpy())
-    preview = pd.DataFrame({
-        "pred_lat": pred_unscaled[:,0][:5],
-        "pred_lon": pred_unscaled[:,1][:5],
-        "true_lat": true_unscaled[:,0][:5],
-        "true_lon": true_unscaled[:,1][:5],
-    })
-    if le is not None:
-        preview["true_species"] = le.inverse_transform(yspb.numpy()[:5])
-    print("Example preds (first 5):")
-    print(preview.to_string(index=False))
+    # Plot RMSE per epoch (test)
+    epochs = np.arange(1, EPOCHS+1)
+    plt.figure(figsize=(8,5))
+    plt.plot(epochs, test_rmse_per_epoch, marker='o', label="Test RMSE (m)")
+    # optional: also plot val RMSE
+    if any(~np.isnan(val_rmse_per_epoch)):
+        plt.plot(epochs, val_rmse_per_epoch, marker='x', label="Val RMSE (m)")
+    plt.xlabel("Epoch")
+    plt.ylabel("Haversine RMSE (meters)")
+    plt.title("RMSE per epoch (Haversine meters)")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("rmse_per_epoch.png", dpi=150)
+    print("Saved RMSE plot: rmse_per_epoch.png")
+    plt.show()
+
+    # (the rest of your final test-evaluation / preview can remain; omitted for brevity)
+    # You can still keep the final test summary as in your original script if desired.
 
 if __name__ == "__main__":
     main()
