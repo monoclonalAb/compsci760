@@ -386,5 +386,78 @@ def main():
     # (the rest of your final test-evaluation / preview can remain; omitted for brevity)
     # You can still keep the final test summary as in your original script if desired.
 
+    # -----------------------
+    # Final evaluation on TEST set (unseen trajectories)
+    # -----------------------
+    model.eval()
+    preds_coords = []
+    trues_coords = []
+    preds_species = []
+    trues_species = []
+    scaled_mse_total = 0.0
+    scaled_ce_total = 0.0
+    n_total = 0
+    with torch.no_grad():
+        for Xb, ylocb, yspb in test_loader:
+            Xb = Xb.to(DEVICE); ylocb = ylocb.to(DEVICE)
+            pred_loc_s, pred_sp = model(Xb)
+            # accumulate scaled losses (for reference)
+            scaled_mse_total += mse(pred_loc_s, ylocb).item() * Xb.size(0)
+            if celoss is not None:
+                scaled_ce_total += celoss(pred_sp, yspb.to(DEVICE)).item() * Xb.size(0)
+            n_total += Xb.size(0)
+
+            # inverse transform to original coords (meters will be computed from degrees)
+            pred_loc_np = pred_loc_s.cpu().numpy()
+            true_loc_np = ylocb.cpu().numpy()
+            pred_unscaled = targ_scaler.inverse_transform(pred_loc_np)   # (batch,2) lat, lon
+            true_unscaled = targ_scaler.inverse_transform(true_loc_np)
+
+            preds_coords.append(pred_unscaled)
+            trues_coords.append(true_unscaled)
+
+            if pred_sp is not None:
+                pred_sp_np = pred_sp.argmax(dim=1).cpu().numpy()
+                preds_species.append(pred_sp_np)
+                trues_species.append(yspb.numpy())
+
+    if n_total == 0:
+        print("WARNING: test set is empty; skipping test evaluation.")
+    else:
+        scaled_test_mse = scaled_mse_total / n_total
+        scaled_test_ce = (scaled_ce_total / n_total) if celoss is not None else None
+        preds_coords = np.vstack(preds_coords)
+        trues_coords = np.vstack(trues_coords)
+
+        # haversine expects lat1, lon1, lat2, lon2 in degrees and returns meters
+        haversine_m = haversine_np(trues_coords[:,0], trues_coords[:,1], preds_coords[:,0], preds_coords[:,1])
+
+        mean_m = float(np.mean(haversine_m))
+        median_m = float(np.median(haversine_m))
+        rmse_m = float(np.sqrt(np.mean(haversine_m**2)))
+        p25, p75, p95 = [float(np.percentile(haversine_m, q)) for q in (25, 75, 95)]
+
+        print("\n=== TEST SET EVALUATION ===")
+        print(f"Test samples: {n_total}")
+        print(f"Scaled Test MSE (on transformed coords): {scaled_test_mse:.6f}")
+        if scaled_test_ce is not None:
+            print(f"Scaled Test CE (classification): {scaled_test_ce:.6f}")
+
+        print("\nLocation errors (Haversine, meters):")
+        print(f"Mean: {mean_m:.2f} m")
+        print(f"Median: {median_m:.2f} m")
+        print(f"RMSE: {rmse_m:.2f} m")
+        print(f"25th/75th/95th percentiles: {p25:.2f} / {p75:.2f} / {p95:.2f} m")
+
+        # if preds_species:
+        #     preds_species = np.concatenate(preds_species)
+        #     trues_species = np.concatenate(trues_species)
+        #     acc = accuracy_score(trues_species, preds_species)
+        #     f1 = f1_score(trues_species, preds_species, average="macro")
+        #     print("\nSpecies classification (test):")
+        #     print(f"Accuracy: {acc:.4f}")
+        #     print(f"Macro-F1: {f1:.4f}")
+
+    # done
 if __name__ == "__main__":
     main()
