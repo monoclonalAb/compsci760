@@ -1,0 +1,10 @@
+numpy==1.26.4
+pandas==2.2.3
+scipy==1.14.1
+scikit-learn==1.5.2
+joblib==1.2.0
+threadpoolctl==3.1.0
+openpyxl==3.1.2
+matplotlib==3.8.0
+nbformat==5.9.2
+jupyterlab==4.3.0
