@@ -11,11 +11,10 @@ import pandas as pd
 import numpy as np
 import json
 
-
 # ---------------------------
 # Step 1. Load & preprocess
 # ---------------------------
-df = pd.read_excel("/Users/gurudassalunke/Desktop/Guru/Study/760 Advanced ML/data/processed_bird_migration.xlsx").dropna(subset=["GPS_xx", "GPS_yy"])
+df = pd.read_excel("data/processed_bird_migration.xlsx").dropna(subset=["GPS_xx", "GPS_yy"])
 
 # Node mapping
 unique_coords = df[["GPS_xx", "GPS_yy"]].drop_duplicates().reset_index(drop=True)
@@ -42,7 +41,6 @@ def build_training_pairs(trajectories, min_len=2):
 
 pairs = build_training_pairs(trajectories)
 num_nodes = len(unique_coords)
-num_species = len(le_species.classes_)
 print("Training pairs:", len(pairs), "| Unique nodes:", num_nodes)
 
 # Temporal aspect
