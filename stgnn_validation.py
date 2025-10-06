@@ -129,7 +129,7 @@ class Attention(nn.Module):
         return context
 
 class GCN_BiLSTM_Attn_Temporal(nn.Module):
-    def __init__(self, num_nodes, gcn_hidden=64, emb_dim=128, lstm_hidden=128,
+    def __init__(self, num_nodes, num_species, gcn_hidden=64, emb_dim=128, lstm_hidden=128,
                  lstm_layers=1, dropout=0.2, temporal_dim=4):
         super().__init__()
         self.node_emb = nn.Embedding(num_nodes, emb_dim)
@@ -138,8 +138,13 @@ class GCN_BiLSTM_Attn_Temporal(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.lstm = nn.LSTM(emb_dim, lstm_hidden, lstm_layers,
                             batch_first=True, dropout=dropout, bidirectional=True)
-        self.attention = Attention(2*lstm_hidden)
-        self.fc = nn.Linear(2*lstm_hidden, num_nodes)
+        #self.attention = Attention(2*lstm_hidden)
+       #Separate attention heads
+        self.attn_node = Attention(2*lstm_hidden)
+        self.attn_species = Attention(2*lstm_hidden)
+        self.fc_node = nn.Linear(2*lstm_hidden, num_nodes)
+        self.fc_species = nn.Linear(2*lstm_hidden, num_species)
+        #self.fc = nn.Linear(2*lstm_hidden, num_nodes)
     def forward(self, x_coords, edge_index, seq, lengths, temporal_features, edge_weight=None):
         node_features = torch.cat([x_coords, self.node_emb.weight, temporal_features], dim=1)
         z = F.relu(self.gcn1(node_features, edge_index, edge_weight=edge_weight))
@@ -150,9 +155,15 @@ class GCN_BiLSTM_Attn_Temporal(nn.Module):
         packed = nn.utils.rnn.pack_padded_sequence(seq_emb, lengths.cpu(), batch_first=True, enforce_sorted=False)
         lstm_out, _ = self.lstm(packed)
         lstm_out, _ = nn.utils.rnn.pad_packed_sequence(lstm_out, batch_first=True)
-        context = self.attention(lstm_out, lengths)
-        out = self.fc(context)
-        return out
+        #context = self.attention(lstm_out, lengths)
+         # Context vectors
+        context_node = self.attn_node(lstm_out, lengths)
+        context_species = self.attn_species(lstm_out, lengths)
+        out_node = self.fc_node(context_node)
+        out_species = self.fc_species(context_species)
+        return out_node, out_species
+        #out = self.fc(context)
+        #return out
 
 # ---------------------------
 # Step 6. Training + evaluation helpers
@@ -162,33 +173,43 @@ x_coords, temporal_features = x_coords.to(device), temporal_features.to(device)
 criterion = nn.CrossEntropyLoss()
 lambda_mse = 0.1
 
-def train_epoch(model, loader, optimizer, edge_index, edge_weight):
+def train_epoch(model, loader, optimizer, edge_index, edge_weight, species_labels):
     model.train()
     total_loss = 0
     for seq, lengths, target in loader:
         seq, lengths, target = seq.to(device), lengths.to(device), target.to(device)
+
+        species_target = species_labels[target].to(device)
         optimizer.zero_grad()
-        out = model(x_coords, edge_index, seq, lengths, temporal_features, edge_weight=edge_weight)
-        ce_loss = criterion(out, target)
-        pred_coords = x_coords[out.argmax(dim=1)]
+        out_node, out_species = model(x_coords, edge_index, seq, lengths, temporal_features, edge_weight=edge_weight)
+        ce_loss_node = criterion(out_node, target)
+        ce_loss_species = criterion(out_species, species_target)
+        #ce_loss = criterion(out, target)
+        pred_coords = x_coords[out_node.argmax(dim=1)]
         true_coords = x_coords[target]
         mse_loss = F.mse_loss(pred_coords, true_coords)
-        loss = ce_loss + lambda_mse * mse_loss
+        loss = ce_loss_node + lambda_mse * mse_loss + 0.4*ce_loss_species
         loss.backward()
         optimizer.step()
         total_loss += loss.item()
     return total_loss / len(loader)
 
 @torch.no_grad()
-def evaluate(model, loader, edge_index, edge_weight, k=5):
+def evaluate(model, loader, edge_index, edge_weight, x_coords, coords_raw, species_labels, device, k=5):
     model.eval()
-    total, correct1, correctk, mse_total, haversine_total = 0, 0, 0, 0.0, 0.0
+    total, correct1, correctk, correct_species = 0, 0, 0, 0
+    mse_total, haversine_total = 0.0, 0.0
     for seq, lengths, target in loader:
         seq, lengths, target = seq.to(device), lengths.to(device), target.to(device)
-        out = model(x_coords, edge_index, seq, lengths, temporal_features, edge_weight=edge_weight)
-        pred_top1 = out.argmax(dim=1)
+        species_target = species_labels[target].to(device)
+        out_node, out_species = model(x_coords, edge_index, seq, lengths, temporal_features, edge_weight=edge_weight)
+        pred_top1 = out_node.argmax(dim=1)
         correct1 += (pred_top1 == target).sum().item()
-        topk = torch.topk(out, k, dim=1).indices
+        topk = torch.topk(out_node, k, dim=1).indices
+# Species classification
+        species_pred = out_species.argmax(dim=1)
+        correct_species += (species_pred == species_target).sum().item()
+
         for i in range(len(target)):
             if target[i] in topk[i]:
                 correctk += 1
@@ -203,7 +224,7 @@ def evaluate(model, loader, edge_index, edge_weight, k=5):
             haversine_total += haversine(pred_coord[0], pred_coord[1], true_coord[0], true_coord[1])
         
         total += len(target)
-    return correct1/total, correctk/total, mse_total/total, haversine_total/total
+    return correct1/total, correctk/total, correct_species/total, mse_total/total, haversine_total/total
 
 # ---------------------------
 # Step 7. Training with validation + hyperparam tuning
@@ -220,6 +241,7 @@ def train_model(config, max_epochs=50, patience=10):
 
     model = GCN_BiLSTM_Attn_Temporal(
         num_nodes,
+        num_species,
         gcn_hidden=gcn_hidden,
         emb_dim=emb_dim,
         dropout=dropout
@@ -232,8 +254,13 @@ def train_model(config, max_epochs=50, patience=10):
     counter = 0
 
     for epoch in range(max_epochs):
-        loss = train_epoch(model, train_loader, optimizer, edge_index, edge_weight)
-        top1_val, top5_val, mse_val, haversine_val = evaluate(model, val_loader, edge_index, edge_weight, k=5)
+        loss = train_epoch(model, train_loader, optimizer, edge_index, edge_weight, species_labels)
+        top1_val, top5_val, species_val, mse_val, haversine_val = evaluate(model, val_loader, edge_index, edge_weight, x_coords,
+        coords_raw,
+        species_labels,
+        device, 
+        k=5
+    )
 
         if top1_val > best_val_top1:
             best_val_top1 = top1_val
@@ -244,11 +271,19 @@ def train_model(config, max_epochs=50, patience=10):
             if counter >= patience:
                 print("Early stopping triggered")
                 break
+                
+# Print progress
 
-        print(f"Epoch {epoch+1} | Train Loss {loss:.4f} | "
-              f"Val Top-1 {top1_val:.3f} | Val Top-5 {top5_val:.3f} | Val MSE {mse_val:.4f} | Val Haversine {haversine_val:.4f} km")
-
+        print(f"Epoch {epoch+1:03d} | "
+          f"Train Loss: {loss:.4f} | "
+          f"Val Top-1: {top1_val:.3f} | "
+          f"Val Top-5: {top5_val:.3f} | "
+          f"Val Species Acc: {species_val:.3f} | "
+          f"Val MSE: {mse_val:.4f} | "
+          f"Val Haversine: {haversine_val:.4f}")
     return best_val_top1, best_model_state, edge_index, edge_weight
+
+        
 
 # ---------------------------
 # Step 8. Hyperparameter search (grid search + logging)
@@ -294,6 +329,21 @@ final_model = GCN_BiLSTM_Attn_Temporal(
 ).to(device)
 final_model.load_state_dict(best_state)
 
-top1_test, top5_test, mse_test, haversine_test = evaluate(final_model, test_loader, best_edge_index, best_edge_weight, k=5)
+top1_test, top5_test, species_test, mse_test, haversine_test = evaluate(
+    final_model,
+    test_loader,
+    best_edge_index,
+    best_edge_weight,
+    x_coords,
+    coords_raw,
+    species_labels,
+    device,
+    k=5
+)
+
 print(f"\nTest Results with {dict(best_cfg)}: "
-      f"Top-1 {top1_test:.3f} | Top-5 {top5_test:.3f} | MSE {mse_test:.4f} | Haversine {haversine_test:.4f} km")
+      f"Top-1 {top1_test:.3f} | "
+      f"Top-5 {top5_test:.3f} | "
+      f"Species Acc {species_test:.3f} | "
+      f"MSE {mse_test:.4f} | "
+      f"Haversine {haversine_test:.4f} km")
