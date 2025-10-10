@@ -23,24 +23,27 @@ df["node_id"] = df.apply(lambda r: coord_to_id[(r["GPS_xx"], r["GPS_yy"])], axis
 
 # Trajectories
 trajectories = df.groupby("Migratory route codes")["node_id"].apply(list).tolist()
+trajectory_durations = df.groupby("Migratory route codes")["duration_h"].apply(list).tolist() # Added durations as edge-level features
 
 # Training pairs
-def build_training_pairs(trajectories, min_len=2):
+def build_training_pairs(trajectories, durations, min_len=2):
     pairs = []
-    for traj in trajectories:
+    for traj, dur in zip(trajectories, durations):
         if len(traj) < min_len:
             continue
         for i in range(1, len(traj)):
             prefix = traj[:i]
             next_node = traj[i]
-            pairs.append((prefix, next_node))
+            dur_seq = [0.0]
+            if i > 1:
+                dur_seq.extend(dur[:i-1])  # durations between nodes in prefix
+            pairs.append((prefix, next_node, dur_seq))
     return pairs
 
-pairs = build_training_pairs(trajectories)
+pairs = build_training_pairs(trajectories, trajectory_durations)
 num_nodes = len(unique_coords)
 print("Training pairs:", len(pairs), "| Unique nodes:", num_nodes)
 
-# Temporal aspect
 # Map start and end months from df
 start_month_map = df.groupby(["GPS_xx", "GPS_yy"])["Migration start month"].first().to_dict()
 end_month_map   = df.groupby(["GPS_xx", "GPS_yy"])["Migration end month"].first().to_dict()
@@ -61,17 +64,19 @@ class TrajectoryDataset(Dataset):
     def __len__(self):
         return len(self.pairs)
     def __getitem__(self, idx):
-        prefix, next_node = self.pairs[idx]
-        return torch.tensor(prefix, dtype=torch.long), torch.tensor(next_node, dtype=torch.long)
+        prefix, next_node, dur_seq = self.pairs[idx]
+        return torch.tensor(prefix, dtype=torch.long), torch.tensor(next_node, dtype=torch.long), torch.tensor(dur_seq, dtype=torch.float)
 
 def collate_fn(batch):
-    prefixes, targets = zip(*batch)
+    prefixes, targets, durations = zip(*batch)
     lengths = [len(p) for p in prefixes]
     max_len = max(lengths)
-    padded = torch.zeros(len(prefixes), max_len, dtype=torch.long)
-    for i, seq in enumerate(prefixes):
-        padded[i, :len(seq)] = seq
-    return padded, torch.tensor(lengths), torch.tensor(targets)
+    padded_seq = torch.zeros(len(prefixes), max_len, dtype=torch.long)
+    padded_dur = torch.zeros(len(prefixes), max_len, dtype=torch.float)
+    for i, (seq, dur) in enumerate(zip(prefixes, durations)):
+        padded_seq[i, :len(seq)] = seq
+        padded_dur[i, :len(dur)] = dur
+    return padded_seq, padded_dur, torch.tensor(lengths), torch.tensor(targets)
 
 train_pairs, test_pairs = train_test_split(pairs, test_size=0.2, random_state=42)
 train_dataset = TrajectoryDataset(train_pairs)
@@ -126,23 +131,37 @@ class Attention(nn.Module):
         return context
 
 class GCN_BiLSTM_Attn_Temporal(nn.Module):
-    def __init__(self, num_nodes, gcn_hidden=64, emb_dim=128, lstm_hidden=128, lstm_layers=1, dropout=0.2, temporal_dim=4):
+    def __init__(self, num_nodes, gcn_hidden=64, emb_dim=128, lstm_hidden=128, lstm_layers=1, dropout=0.2, temporal_dim=4, dur_dim=32):
         super().__init__()
         self.node_emb = nn.Embedding(num_nodes, emb_dim)
+
         self.gcn1 = GCNConv(2 + emb_dim + temporal_dim, gcn_hidden)
         self.gcn2 = GCNConv(gcn_hidden, emb_dim)
         self.dropout = nn.Dropout(dropout)
-        self.lstm = nn.LSTM(emb_dim, lstm_hidden, lstm_layers, batch_first=True, dropout=dropout, bidirectional=True)
+
+        self.duration_mlp = nn.Sequential(
+            nn.Linear(1, 16),
+            nn.ReLU(),
+            nn.Linear(16, dur_dim),
+        )
+
+        self.lstm = nn.LSTM(emb_dim + dur_dim, lstm_hidden, lstm_layers, batch_first=True, dropout=dropout, bidirectional=True)
         self.attention = Attention(2*lstm_hidden)
         self.fc = nn.Linear(2*lstm_hidden, num_nodes)
-    def forward(self, x_coords, edge_index, seq, lengths, temporal_features, edge_weight=None):
+
+    def forward(self, x_coords, edge_index, seq, durations, lengths, temporal_features, edge_weight=None):
         node_features = torch.cat([x_coords, self.node_emb.weight, temporal_features], dim=1)
         z = F.relu(self.gcn1(node_features, edge_index, edge_weight=edge_weight))
         z = self.dropout(z)
         z = self.gcn2(z, edge_index, edge_weight=edge_weight)
         z = self.dropout(z)
         seq_emb = z[seq]
-        packed = nn.utils.rnn.pack_padded_sequence(seq_emb, lengths.cpu(), batch_first=True, enforce_sorted=False)
+
+        dur_normalized = torch.log1p(durations).unsqueeze(-1)
+        dur_emb = self.duration_mlp(dur_normalized)
+        combined_emb = torch.cat([seq_emb, dur_emb], dim=-1)
+
+        packed = nn.utils.rnn.pack_padded_sequence(combined_emb, lengths.cpu(), batch_first=True, enforce_sorted=False)
         lstm_out, _ = self.lstm(packed)
         lstm_out, _ = nn.utils.rnn.pad_packed_sequence(lstm_out, batch_first=True)
         context = self.attention(lstm_out, lengths)
@@ -162,10 +181,10 @@ lambda_mse = 0.1
 def train_epoch(model, loader):
     model.train()
     total_loss = 0
-    for seq, lengths, target in loader:
-        seq, lengths, target = seq.to(device), lengths.to(device), target.to(device)
+    for seq, durations, lengths, target in loader:
+        seq, durations, lengths, target = seq.to(device), durations.to(device), lengths.to(device), target.to(device)
         optimizer.zero_grad()
-        out = model(x_coords, edge_index, seq, lengths, temporal_features, edge_weight=edge_weight)
+        out = model(x_coords, edge_index, seq, durations, lengths, temporal_features, edge_weight=edge_weight)
         ce_loss = criterion(out, target)
         pred_coords = x_coords[out.argmax(dim=1)]
         true_coords = x_coords[target]
@@ -180,9 +199,9 @@ def train_epoch(model, loader):
 def evaluate(model, loader, k=5):
     model.eval()
     total, correct1, correctk, mse_total = 0, 0, 0, 0.0
-    for seq, lengths, target in loader:
-        seq, lengths, target = seq.to(device), lengths.to(device), target.to(device)
-        out = model(x_coords, edge_index, seq, lengths, temporal_features, edge_weight=edge_weight)
+    for seq, durations, lengths, target in loader:
+        seq, durations, lengths, target = seq.to(device), durations.to(device), lengths.to(device), target.to(device)
+        out = model(x_coords, edge_index, seq, durations, lengths, temporal_features, edge_weight=edge_weight)
         pred_top1 = out.argmax(dim=1)
         correct1 += (pred_top1 == target).sum().item()
         topk = torch.topk(out, k, dim=1).indices
