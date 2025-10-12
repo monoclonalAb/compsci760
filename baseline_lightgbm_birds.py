@@ -29,15 +29,15 @@ LGB_PARAMS = {
     "objective": "regression",
     "metric": "rmse",
     "boosting_type": "gbdt",
-    "learning_rate": 0.05,
-    "num_leaves": 31,
-    "min_data_in_leaf": 20,
+    "learning_rate": 0.03533246802507981,
+    "num_leaves": 29,
+    "min_data_in_leaf": 14,
     "seed": RANDOM_SEED,
     "verbose": -1,
 }
 
-N_ESTIMATORS = 1000
-EARLY_STOPPING_ROUNDS = 50
+N_ESTIMATORS = 1428
+EARLY_STOPPING_ROUNDS = 77
 
 # --------- HELPERS ----------
 def haversine_meters(lat1, lon1, lat2, lon2):

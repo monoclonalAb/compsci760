@@ -6,6 +6,7 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.neighbors import NearestNeighbors
+from sklearn.calibration import LabelEncoder
 from src.preprocessing import haversine
 import pandas as pd
 import numpy as np
@@ -15,6 +16,10 @@ import json
 # Step 1. Load & preprocess
 # ---------------------------
 df = pd.read_excel("data/processed_bird_migration.xlsx").dropna(subset=["GPS_xx", "GPS_yy"])
+le_species = LabelEncoder()
+df["species_label"] = le_species.fit_transform(df["Bird species"])
+num_species = len(le_species.classes_)
+species_labels = torch.tensor(df["species_label"].values, dtype=torch.long)
 
 # Node mapping
 unique_coords = df[["GPS_xx", "GPS_yy"]].drop_duplicates().reset_index(drop=True)
@@ -55,7 +60,7 @@ unique_coords["end_month"] = unique_coords.apply(
 )
 
 # Species labels mapping
-species_map = df.groupby(["GPS_xx", "GPS_yy"])["Species"].first().to_dict()
+species_map = df.groupby(["GPS_xx", "GPS_yy"])["Bird species"].first().to_dict()
 unique_coords["species"] = unique_coords.apply(
     lambda r: species_map.get((r["GPS_xx"], r["GPS_yy"]), "Unknown"), axis=1
 )

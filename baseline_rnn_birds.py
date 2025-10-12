@@ -21,11 +21,11 @@ SCALER_PATH = "./baseline_results/rnn_results/model/baseline_scalers.npz"
 OUT_DIR = "./baseline_results/rnn_results"
 
 SEQ_LEN = 1
-BATCH_SIZE = 128
-HIDDEN_SIZE = 32
-NUM_LAYERS = 1
-EPOCHS = 100
-LR = 1e-3
+BATCH_SIZE = 64
+HIDDEN_SIZE = 128
+NUM_LAYERS = 2
+EPOCHS = 106
+LR = 0.0013271748871217619
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 RANDOM_SEED = 0
 
