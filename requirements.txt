@@ -8,4 +8,5 @@ openpyxl==3.1.2
 matplotlib==3.8.0
 nbformat==5.9.2
 jupyterlab==4.3.0
+lightgbm==4.0.0
 torch_geometric==2.6.1

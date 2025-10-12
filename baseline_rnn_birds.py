@@ -3,6 +3,7 @@
 import os
 import numpy as np
 import pandas as pd
+import random
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, f1_score
@@ -15,8 +16,9 @@ import matplotlib.pyplot as plt  # <- added for plotting
 # Config (same as yours)
 # -----------------------
 DATA_PATH = "./data/processed_bird_migration.xlsx"   # change if needed
-MODEL_PATH = "./baseline_rnn_birds.pth"
-SCALER_PATH = "./baseline_scalers.npz"
+MODEL_PATH = "./baseline_results/rnn_results/model/baseline_rnn_birds.pth"
+SCALER_PATH = "./baseline_results/rnn_results/model/baseline_scalers.npz"
+OUT_DIR = "./baseline_results/rnn_results"
 
 SEQ_LEN = 1
 BATCH_SIZE = 128
@@ -25,7 +27,26 @@ NUM_LAYERS = 1
 EPOCHS = 100
 LR = 1e-3
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-RANDOM_SEED = 42
+RANDOM_SEED = 0
+
+# Fix Python built-in RNG
+os.environ["PYTHONHASHSEED"] = str(RANDOM_SEED)
+random.seed(RANDOM_SEED)
+
+# Fix NumPy RNG
+np.random.seed(RANDOM_SEED)
+
+# Fix PyTorch RNGs (CPU + CUDA)
+torch.manual_seed(RANDOM_SEED)
+torch.cuda.manual_seed_all(RANDOM_SEED)
+
+# Ensure deterministic behavior for cuDNN (used by LSTM)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+# Enforce deterministic algorithms in PyTorch where possible
+torch.use_deterministic_algorithms(True)
+
 
 # -----------------------
 # Helpers (unchanged)
@@ -215,7 +236,7 @@ def main():
             for rid, _ in meta_list:
                 sp = route_to_species.get(rid, None)
                 if sp is None:
-                    species_for_seq.append(-1)
+                    species_for_seq.append(0)
                 else:
                     species_for_seq.append(int(le.transform([str(sp)])[0]))
             return np.array(species_for_seq, dtype=np.int64)
@@ -237,9 +258,11 @@ def main():
     val_ds = TrajStepDataset(X_val_s, Y_val_s, sp_val)
     test_ds = TrajStepDataset(X_test_s, Y_test_s, sp_test)
 
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
-    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
+    g = torch.Generator()
+    g.manual_seed(RANDOM_SEED)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, generator=g)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, generator=g)
+    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, generator=g)
 
     model = BaselineLSTM(feat_dim, hidden_size=HIDDEN_SIZE, num_layers=NUM_LAYERS, num_species=num_species).to(DEVICE)
     opt = torch.optim.Adam(model.parameters(), lr=LR)
@@ -293,9 +316,19 @@ def main():
         p25, p75, p95 = [float(np.percentile(dists, q)) for q in (25, 75, 95)]
         return mean_m, median_m, rmse_m, p25, p75, p95, n_total
 
-    # Lists to track RMSE per epoch
+    # Lists to track RMSE per epoch (for plotting)
     test_rmse_per_epoch = []
-    val_rmse_per_epoch = []  # optional: track val as well if desired
+    val_rmse_per_epoch = []
+
+    # Prepare CSV logging
+    metrics_csv_path = os.path.join(OUT_DIR, "epoch_metrics.csv")
+    os.makedirs(OUT_DIR, exist_ok=True)
+    with open(metrics_csv_path, "w") as f:
+        f.write(
+            "epoch,train_mse,train_ce,val_mse,val_ce,"
+            "val_mean_m,val_median_m,val_rmse_m,val_p25,val_p75,val_p95,"
+            "test_mean_m,test_median_m,test_rmse_m,test_p25,test_p75,test_p95\n"
+        )
 
     # training loop (modified to run test evaluation every epoch)
     for epoch in range(1, EPOCHS+1):
@@ -316,38 +349,48 @@ def main():
                 running_ce += celoss(pred_sp, yspb.to(DEVICE)).item() * bs
             tot += bs
         train_mse = running_mse / tot
-        train_ce = (running_ce / tot) if celoss is not None else None
+        train_ce = (running_ce / tot) if celoss is not None else np.nan
 
         # validation (scaled MSE for monitoring)
         val_mse, val_ce = evaluate(val_loader)
+        if val_ce is None:
+            val_ce = np.nan
 
-        # NEW: run Haversine evaluation on validation & test set (unscaled, meters)
+        # Haversine evaluation on val/test
         val_hav = evaluate_haversine(val_loader)
         test_hav = evaluate_haversine(test_loader)
 
-        # record RMSE (test) for plotting
-        if test_hav is not None:
-            _, _, test_rmse_m, _, _, _, _ = test_hav
-            test_rmse_per_epoch.append(test_rmse_m)
-        else:
-            test_rmse_per_epoch.append(np.nan)
+        # Extract haversine metrics or NaNs if not available
+        def unpack_hav(hav):
+            if hav is None:
+                return (np.nan,)*7
+            return hav
 
-        if val_hav is not None:
-            _, _, val_rmse_m, _, _, _, _ = val_hav
-            val_rmse_per_epoch.append(val_rmse_m)
-        else:
-            val_rmse_per_epoch.append(np.nan)
+        val_mean_m, val_median_m, val_rmse_m, val_p25, val_p75, val_p95, _ = unpack_hav(val_hav)
+        test_mean_m, test_median_m, test_rmse_m, test_p25, test_p75, test_p95, _ = unpack_hav(test_hav)
+
+        # record RMSE for plotting
+        test_rmse_per_epoch.append(test_rmse_m)
+        val_rmse_per_epoch.append(val_rmse_m)
 
         # print nicely
         msg = (f"Epoch {epoch:02d} | Train MSE: {train_mse:.6f}" +
-               (f", Train CE: {train_ce:.4f}" if train_ce is not None else "") +
+               (f", Train CE: {train_ce:.4f}" if not np.isnan(train_ce) else "") +
                f" | Val MSE: {val_mse:.6f}" +
-               (f", Val CE: {val_ce:.4f}" if val_ce is not None else ""))
-        if val_hav is not None:
-            msg += f" | Val RMSE: {val_hav[2]:.2f} m"
-        if test_hav is not None:
-            msg += f" | Test RMSE: {test_hav[2]:.2f} m"
+               (f", Val CE: {val_ce:.4f}" if not np.isnan(val_ce) else ""))
+        if not np.isnan(val_rmse_m):
+            msg += f" | Val RMSE: {val_rmse_m:.2f} m"
+        if not np.isnan(test_rmse_m):
+            msg += f" | Test RMSE: {test_rmse_m:.2f} m"
         print(msg)
+
+        # 🔸 Write metrics for this epoch to CSV
+        with open(metrics_csv_path, "a") as f:
+            f.write(
+                f"{epoch},{train_mse},{train_ce},{val_mse},{val_ce},"
+                f"{val_mean_m},{val_median_m},{val_rmse_m},{val_p25},{val_p75},{val_p95},"
+                f"{test_mean_m},{test_median_m},{test_rmse_m},{test_p25},{test_p75},{test_p95}\n"
+            )
 
     # save model + scalers + classes (same as yours)
     save_dict = {
@@ -379,7 +422,7 @@ def main():
     plt.grid(True)
     plt.legend()
     plt.tight_layout()
-    plt.savefig("rmse_per_epoch.png", dpi=150)
+    plt.savefig(os.path.join(OUT_DIR, "rmse_per_epoch.png"), dpi=150)
     print("Saved RMSE plot: rmse_per_epoch.png")
     plt.show()
 
@@ -448,15 +491,6 @@ def main():
         print(f"Median: {median_m:.2f} m")
         print(f"RMSE: {rmse_m:.2f} m")
         print(f"25th/75th/95th percentiles: {p25:.2f} / {p75:.2f} / {p95:.2f} m")
-
-        # if preds_species:
-        #     preds_species = np.concatenate(preds_species)
-        #     trues_species = np.concatenate(trues_species)
-        #     acc = accuracy_score(trues_species, preds_species)
-        #     f1 = f1_score(trues_species, preds_species, average="macro")
-        #     print("\nSpecies classification (test):")
-        #     print(f"Accuracy: {acc:.4f}")
-        #     print(f"Macro-F1: {f1:.4f}")
 
     # done
 if __name__ == "__main__":

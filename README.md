@@ -4,8 +4,8 @@ Spatiotemporal Graph Neural Networks for Predicting Migratory Bird Movements and
 ### Installation
 
 ```
-conda create -n rnn python=3.11.4
-conda activate rnn
+conda create -n 760 python=3.11.4
+conda activate 760
 conda install -c conda-forge -y \
   numpy=1.26.4 \
   pandas=2.2.3 \

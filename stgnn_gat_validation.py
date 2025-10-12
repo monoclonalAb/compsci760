@@ -1,8 +1,7 @@
-from sklearn.calibration import LabelEncoder
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GCNConv
+from torch_geometric.nn import GATConv
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
@@ -16,10 +15,6 @@ import json
 # Step 1. Load & preprocess
 # ---------------------------
 df = pd.read_excel("data/processed_bird_migration.xlsx").dropna(subset=["GPS_xx", "GPS_yy"])
-le_species = LabelEncoder()
-df["species_label"] = le_species.fit_transform(df["Bird species"])
-num_species = len(le_species.classes_)
-species_labels = torch.tensor(df["species_label"].values, dtype=torch.long)
 
 # Node mapping
 unique_coords = df[["GPS_xx", "GPS_yy"]].drop_duplicates().reset_index(drop=True)
@@ -58,6 +53,18 @@ unique_coords["start_month"] = unique_coords.apply(
 unique_coords["end_month"] = unique_coords.apply(
     lambda r: end_month_map.get((r["GPS_xx"], r["GPS_yy"]), 1), axis=1
 )
+
+# Species labels mapping
+species_map = df.groupby(["GPS_xx", "GPS_yy"])["Species"].first().to_dict()
+unique_coords["species"] = unique_coords.apply(
+    lambda r: species_map.get((r["GPS_xx"], r["GPS_yy"]), "Unknown"), axis=1
+)
+unique_species = unique_coords["species"].unique()
+species_to_id = {s: i for i, s in enumerate(unique_species)}
+unique_coords["species_id"] = unique_coords["species"].map(species_to_id)
+species_labels = torch.tensor(unique_coords["species_id"].values, dtype=torch.long)
+num_species = len(unique_species)
+print(f"Number of species: {num_species}")
 
 # ---------------------------
 # Step 2. Dataset + Dataloader (70-15-15 split)
@@ -115,11 +122,10 @@ def build_knn_graph(coords_scaled, k):
     knn.fit(coords_scaled)
     neighbors = knn.kneighbors_graph(coords_scaled).tocoo()
     edge_index = torch.tensor([neighbors.row, neighbors.col], dtype=torch.long)
-    edge_weight = torch.ones(edge_index.size(1))
-    return edge_index, edge_weight
+    return edge_index
 
 # ---------------------------
-# Step 5. Model definition (Bi-LSTM + Attention)
+# Step 5. Model definition (GAT + Bi-LSTM + Attention)
 # ---------------------------
 class Attention(nn.Module):
     def __init__(self, hidden_dim):
@@ -133,42 +139,51 @@ class Attention(nn.Module):
         context = (lstm_outputs * attn_weights).sum(dim=1)
         return context
 
-class GCN_BiLSTM_Attn_Temporal(nn.Module):
-    def __init__(self, num_nodes, num_species, gcn_hidden=64, emb_dim=128, lstm_hidden=128,
-                 lstm_layers=1, dropout=0.2, temporal_dim=4):
+class GAT_BiLSTM_Attn_Temporal(nn.Module):
+    def __init__(self, num_nodes, num_species, gat_hidden=64, emb_dim=128, lstm_hidden=128,
+                 lstm_layers=1, dropout=0.2, temporal_dim=4, heads=4):
         super().__init__()
         self.node_emb = nn.Embedding(num_nodes, emb_dim)
-        self.gcn1 = GCNConv(2 + emb_dim + temporal_dim, gcn_hidden)
-        self.gcn2 = GCNConv(gcn_hidden, emb_dim)
+        
+        # GAT layers with multi-head attention
+        self.gat1 = GATConv(2 + emb_dim + temporal_dim, gat_hidden, heads=heads, dropout=dropout)
+        self.gat2 = GATConv(heads * gat_hidden, emb_dim, heads=1, concat=False, dropout=dropout)
+        
         self.dropout = nn.Dropout(dropout)
         self.lstm = nn.LSTM(emb_dim, lstm_hidden, lstm_layers,
-                            batch_first=True, dropout=dropout, bidirectional=True)
-        #self.attention = Attention(2*lstm_hidden)
-       #Separate attention heads
+                            batch_first=True, dropout=dropout if lstm_layers > 1 else 0, 
+                            bidirectional=True)
+        
+        # Separate attention heads for multi-task learning
         self.attn_node = Attention(2*lstm_hidden)
         self.attn_species = Attention(2*lstm_hidden)
+        
         self.fc_node = nn.Linear(2*lstm_hidden, num_nodes)
         self.fc_species = nn.Linear(2*lstm_hidden, num_species)
-        #self.fc = nn.Linear(2*lstm_hidden, num_nodes)
-    def forward(self, x_coords, edge_index, seq, lengths, temporal_features, edge_weight=None):
+        
+    def forward(self, x_coords, edge_index, seq, lengths, temporal_features):
+        # Concatenate node features
         node_features = torch.cat([x_coords, self.node_emb.weight, temporal_features], dim=1)
-        z = F.relu(self.gcn1(node_features, edge_index, edge_weight=edge_weight))
+        
+        # GAT layers - attention weights are learned automatically
+        z = F.elu(self.gat1(node_features, edge_index))
         z = self.dropout(z)
-        z = self.gcn2(z, edge_index, edge_weight=edge_weight)
+        z = self.gat2(z, edge_index)
         z = self.dropout(z)
+        
+        # Sequence embedding
         seq_emb = z[seq]
         packed = nn.utils.rnn.pack_padded_sequence(seq_emb, lengths.cpu(), batch_first=True, enforce_sorted=False)
         lstm_out, _ = self.lstm(packed)
         lstm_out, _ = nn.utils.rnn.pad_packed_sequence(lstm_out, batch_first=True)
-        #context = self.attention(lstm_out, lengths)
-         # Context vectors
+        
+        # Context vectors with separate attention
         context_node = self.attn_node(lstm_out, lengths)
         context_species = self.attn_species(lstm_out, lengths)
+        
         out_node = self.fc_node(context_node)
         out_species = self.fc_species(context_species)
         return out_node, out_species
-        #out = self.fc(context)
-        #return out
 
 # ---------------------------
 # Step 6. Training + evaluation helpers
@@ -178,7 +193,7 @@ x_coords, temporal_features = x_coords.to(device), temporal_features.to(device)
 criterion = nn.CrossEntropyLoss()
 lambda_mse = 0.1
 
-def train_epoch(model, loader, optimizer, edge_index, edge_weight, species_labels):
+def train_epoch(model, loader, optimizer, edge_index, species_labels):
     model.train()
     total_loss = 0
     for seq, lengths, target in loader:
@@ -186,10 +201,9 @@ def train_epoch(model, loader, optimizer, edge_index, edge_weight, species_label
 
         species_target = species_labels[target].to(device)
         optimizer.zero_grad()
-        out_node, out_species = model(x_coords, edge_index, seq, lengths, temporal_features, edge_weight=edge_weight)
+        out_node, out_species = model(x_coords, edge_index, seq, lengths, temporal_features)
         ce_loss_node = criterion(out_node, target)
         ce_loss_species = criterion(out_species, species_target)
-        #ce_loss = criterion(out, target)
         pred_coords = x_coords[out_node.argmax(dim=1)]
         true_coords = x_coords[target]
         mse_loss = F.mse_loss(pred_coords, true_coords)
@@ -200,18 +214,19 @@ def train_epoch(model, loader, optimizer, edge_index, edge_weight, species_label
     return total_loss / len(loader)
 
 @torch.no_grad()
-def evaluate(model, loader, edge_index, edge_weight, x_coords, coords_raw, species_labels, device, k=5):
+def evaluate(model, loader, edge_index, x_coords, coords_raw, species_labels, device, k=5):
     model.eval()
     total, correct1, correctk, correct_species = 0, 0, 0, 0
     mse_total, haversine_total = 0.0, 0.0
     for seq, lengths, target in loader:
         seq, lengths, target = seq.to(device), lengths.to(device), target.to(device)
         species_target = species_labels[target].to(device)
-        out_node, out_species = model(x_coords, edge_index, seq, lengths, temporal_features, edge_weight=edge_weight)
+        out_node, out_species = model(x_coords, edge_index, seq, lengths, temporal_features)
         pred_top1 = out_node.argmax(dim=1)
         correct1 += (pred_top1 == target).sum().item()
         topk = torch.topk(out_node, k, dim=1).indices
-# Species classification
+        
+        # Species classification
         species_pred = out_species.argmax(dim=1)
         correct_species += (species_pred == species_target).sum().item()
 
@@ -236,20 +251,22 @@ def evaluate(model, loader, edge_index, edge_weight, x_coords, coords_raw, speci
 # ---------------------------
 def train_model(config, max_epochs=50, patience=10):
     k = config["k"]
-    gcn_hidden = config["gcn_hidden"]
+    gat_hidden = config["gat_hidden"]
     emb_dim = config["emb_dim"]
     dropout = config["dropout"]
+    heads = config["heads"]
 
     print(f"\nTraining with config: {config}")
-    edge_index, edge_weight = build_knn_graph(coords_scaled, k)
-    edge_index, edge_weight = edge_index.to(device), edge_weight.to(device)
+    edge_index = build_knn_graph(coords_scaled, k)
+    edge_index = edge_index.to(device)
 
-    model = GCN_BiLSTM_Attn_Temporal(
+    model = GAT_BiLSTM_Attn_Temporal(
         num_nodes,
         num_species,
-        gcn_hidden=gcn_hidden,
+        gat_hidden=gat_hidden,
         emb_dim=emb_dim,
-        dropout=dropout
+        dropout=dropout,
+        heads=heads
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
@@ -259,13 +276,11 @@ def train_model(config, max_epochs=50, patience=10):
     counter = 0
 
     for epoch in range(max_epochs):
-        loss = train_epoch(model, train_loader, optimizer, edge_index, edge_weight, species_labels)
-        top1_val, top5_val, species_val, mse_val, haversine_val = evaluate(model, val_loader, edge_index, edge_weight, x_coords,
-        coords_raw,
-        species_labels,
-        device, 
-        k=5
-    )
+        loss = train_epoch(model, train_loader, optimizer, edge_index, species_labels)
+        top1_val, top5_val, species_val, mse_val, haversine_val = evaluate(
+            model, val_loader, edge_index, x_coords,
+            coords_raw, species_labels, device, k=5
+        )
 
         if top1_val > best_val_top1:
             best_val_top1 = top1_val
@@ -277,45 +292,51 @@ def train_model(config, max_epochs=50, patience=10):
                 print("Early stopping triggered")
                 break
                 
-# Print progress
-
+        # Print progress
         print(f"Epoch {epoch+1:03d} | "
-          f"Train Loss: {loss:.4f} | "
-          f"Val Top-1: {top1_val:.3f} | "
-          f"Val Top-5: {top5_val:.3f} | "
-          f"Val Species Acc: {species_val:.3f} | "
-          f"Val MSE: {mse_val:.4f} | "
-          f"Val Haversine: {haversine_val:.4f}")
-    return best_val_top1, best_model_state, edge_index, edge_weight
-
-        
+              f"Train Loss: {loss:.4f} | "
+              f"Val Top-1: {top1_val:.3f} | "
+              f"Val Top-5: {top5_val:.3f} | "
+              f"Val Species Acc: {species_val:.3f} | "
+              f"Val MSE: {mse_val:.4f} | "
+              f"Val Haversine: {haversine_val:.4f}")
+    
+    return best_val_top1, best_model_state, edge_index
 
 # ---------------------------
 # Step 8. Hyperparameter search (grid search + logging)
 # ---------------------------
 candidate_k = [3, 5, 7]
-candidate_gcn_hidden = [32, 64]
+candidate_gat_hidden = [32, 64]
 candidate_emb_dim = [64, 128]
 candidate_dropout = [0.2, 0.5]
+candidate_heads = [2, 4, 8]  # Number of attention heads in GAT
 
 configs = []
 for k in candidate_k:
-    for g in candidate_gcn_hidden:
+    for g in candidate_gat_hidden:
         for e in candidate_emb_dim:
             for d in candidate_dropout:
-                configs.append({"k": k, "gcn_hidden": g, "emb_dim": e, "dropout": d})
+                for h in candidate_heads:
+                    configs.append({
+                        "k": k, 
+                        "gat_hidden": g, 
+                        "emb_dim": e, 
+                        "dropout": d,
+                        "heads": h
+                    })
 
 results = {}
 log_records = []
 
 for cfg in configs:
-    val_top1, model_state, edge_index, edge_weight = train_model(cfg)
-    results[tuple(cfg.items())] = (val_top1, model_state, edge_index, edge_weight)
+    val_top1, model_state, edge_index = train_model(cfg)
+    results[tuple(cfg.items())] = (val_top1, model_state, edge_index)
     log_records.append({"config": cfg, "val_top1": val_top1})
 
 # Save logs
-pd.DataFrame(log_records).to_csv("hyperparam_results.csv", index=False)
-with open("hyperparam_results.json", "w") as f:
+pd.DataFrame(log_records).to_csv("hyperparam_results_gat.csv", index=False)
+with open("hyperparam_results_gat.json", "w") as f:
     json.dump(log_records, f, indent=2)
 
 # Pick best config
@@ -325,12 +346,16 @@ print(f"\nBest config: {dict(best_cfg)}")
 # ---------------------------
 # Step 9. Final evaluation on test set
 # ---------------------------
-best_val_top1, best_state, best_edge_index, best_edge_weight = results[best_cfg]
-final_model = GCN_BiLSTM_Attn_Temporal(
+best_val_top1, best_state, best_edge_index = results[best_cfg]
+cfg_dict = dict(best_cfg)
+
+final_model = GAT_BiLSTM_Attn_Temporal(
     num_nodes,
-    gcn_hidden=dict(best_cfg)["gcn_hidden"],
-    emb_dim=dict(best_cfg)["emb_dim"],
-    dropout=dict(best_cfg)["dropout"]
+    num_species,
+    gat_hidden=cfg_dict["gat_hidden"],
+    emb_dim=cfg_dict["emb_dim"],
+    dropout=cfg_dict["dropout"],
+    heads=cfg_dict["heads"]
 ).to(device)
 final_model.load_state_dict(best_state)
 
@@ -338,7 +363,6 @@ top1_test, top5_test, species_test, mse_test, haversine_test = evaluate(
     final_model,
     test_loader,
     best_edge_index,
-    best_edge_weight,
     x_coords,
     coords_raw,
     species_labels,
@@ -346,9 +370,24 @@ top1_test, top5_test, species_test, mse_test, haversine_test = evaluate(
     k=5
 )
 
-print(f"\nTest Results with {dict(best_cfg)}: "
+print(f"\nTest Results with {cfg_dict}: "
       f"Top-1 {top1_test:.3f} | "
       f"Top-5 {top5_test:.3f} | "
       f"Species Acc {species_test:.3f} | "
       f"MSE {mse_test:.4f} | "
       f"Haversine {haversine_test:.4f} km")
+
+# Save final model
+torch.save({
+    'model_state_dict': best_state,
+    'config': cfg_dict,
+    'test_metrics': {
+        'top1': top1_test,
+        'top5': top5_test,
+        'species_acc': species_test,
+        'mse': mse_test,
+        'haversine': haversine_test
+    }
+}, "best_model_gat_final.pt")
+
+print("\nModel saved to best_model_gat_final.pt")

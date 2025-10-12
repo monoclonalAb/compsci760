@@ -4,6 +4,7 @@ lgb_next_location_haversine_per_iter.py
 LightGBM baseline for predicting next GPS coordinate (latitude, longitude)
 with per-iteration Haversine RMSE (meters) evaluation & plotting.
 """
+
 import os
 import math
 import numpy as np
@@ -17,10 +18,10 @@ import matplotlib.pyplot as plt
 
 # --------- CONFIG ----------
 DATA_PATH = "./data/processed_bird_migration.xlsx"   # change if needed
-OUT_DIR = "./lgb_results"
+OUT_DIR = "./baseline/lgb_results"
 os.makedirs(OUT_DIR, exist_ok=True)
 
-RANDOM_SEED = 42
+RANDOM_SEED = 0
 TRAIN_FRAC, VAL_FRAC, TEST_FRAC = 0.70, 0.15, 0.15
 
 # LightGBM params (base)
