@@ -1,0 +1,10 @@
+Best RMSE: 453475.00 meters
+
+Best Hyperparameters:
+seq_len: 1
+batch_size: 64
+hidden_size: 128
+num_layers: 2
+dropout: 0.1230304651795222
+learning_rate: 0.0013271748871217619
+epochs: 106

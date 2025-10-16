@@ -1,0 +1,15 @@
+Best RMSE: 402290.84 meters
+
+Best Hyperparameters:
+boosting_type: gbdt
+learning_rate: 0.03533246802507981
+num_leaves: 29
+min_data_in_leaf: 14
+max_depth: 10
+feature_fraction: 0.9986156206915907
+bagging_fraction: 0.593606395505568
+bagging_freq: 1
+lambda_l1: 6.441545439058192
+lambda_l2: 4.464870199285054
+n_estimators: 1428
+early_stopping_rounds: 77

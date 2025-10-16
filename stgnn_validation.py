@@ -1,3 +1,4 @@
+from sklearn.calibration import LabelEncoder
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,6 +16,10 @@ import json
 # Step 1. Load & preprocess
 # ---------------------------
 df = pd.read_excel("data/processed_bird_migration.xlsx").dropna(subset=["GPS_xx", "GPS_yy"])
+le_species = LabelEncoder()
+df["species_label"] = le_species.fit_transform(df["Bird species"])
+num_species = len(le_species.classes_)
+species_labels = torch.tensor(df["species_label"].values, dtype=torch.long)
 
 # Node mapping
 unique_coords = df[["GPS_xx", "GPS_yy"]].drop_duplicates().reset_index(drop=True)
