@@ -11,6 +11,9 @@ from src.preprocessing import haversine
 import pandas as pd
 import numpy as np
 import json
+import os
+
+OUT_DIR = "./gat_results"
 
 # ---------------------------
 # Step 1. Load & preprocess
@@ -393,6 +396,6 @@ torch.save({
         'mse': mse_test,
         'haversine': haversine_test
     }
-}, "best_model_gat_final.pt")
+}, os.path.join(OUT_DIR, "best_model_gat_final.pt"))
 
 print("\nModel saved to best_model_gat_final.pt")
