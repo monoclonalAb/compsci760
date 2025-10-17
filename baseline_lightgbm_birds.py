@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 
 # --------- CONFIG ----------
 DATA_PATH = "./data/processed_bird_migration.xlsx"   # change if needed
-OUT_DIR = "./baseline/lgb_results"
+OUT_DIR = "./baseline_results/lgb_results"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 RANDOM_SEED = 0

@@ -8,6 +8,19 @@ from sklearn.model_selection import train_test_split
 from sklearn.neighbors import NearestNeighbors
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
+import math
+import os
+
+# Hyperparameters
+
+K = 3
+GAT_HIDDEN = 64
+EMB_DIM = 64
+DROPOUT = 0.2
+HEADS = 8
+
+OUT_DIR = "./gat_results"
 
 # ---------------------------
 # Step 1. Load & preprocess
@@ -101,7 +114,7 @@ temporal_features = torch.tensor(
 # Step 4. Build k-NN edges only
 # ---------------------------
 # k-NN edges
-knn = NearestNeighbors(n_neighbors=5)
+knn = NearestNeighbors(n_neighbors=K)
 knn.fit(coords_scaled)
 neighbors = knn.kneighbors_graph(coords_scaled).tocoo()
 edge_index = torch.tensor([neighbors.row, neighbors.col], dtype=torch.long)
@@ -122,7 +135,7 @@ class Attention(nn.Module):
         return context
 
 class GAT_BiLSTM_Attn_Temporal(nn.Module):
-    def __init__(self, num_nodes, gat_hidden=64, emb_dim=128, lstm_hidden=128, 
+    def __init__(self, num_nodes, gat_hidden=GAT_HIDDEN, emb_dim=EMB_DIM, lstm_hidden=128, 
                  lstm_layers=1, dropout=0.2, temporal_dim=4, heads=4):
         super().__init__()
         self.node_emb = nn.Embedding(num_nodes, emb_dim)
@@ -203,17 +216,103 @@ def evaluate(model, loader, k=5):
         total += len(target)
     return correct1/total, correctk/total, mse_total/total
 
+# ---------------------------------------
+# Helper: haversine distance (in km)
+# ---------------------------------------
+def haversine_distance(lat1, lon1, lat2, lon2):
+    # convert to radians
+    lat1, lon1, lat2, lon2 = map(torch.deg2rad, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = torch.sin(dlat / 2)**2 + torch.cos(lat1) * torch.cos(lat2) * torch.sin(dlon / 2)**2
+    c = 2 * torch.atan2(torch.sqrt(a), torch.sqrt(1 - a))
+    R = 6371.0  # Earth radius in kilometers
+    return R * c
+
+# ---------------------------------------
+# Track metrics each epoch
+# ---------------------------------------
+history = {
+    "epoch": [],
+    "top1": [],
+    "top5": [],
+    "mse": [],
+    "haversine_rmse": []
+}
+
+@torch.no_grad()
+def evaluate_with_haversine(model, loader, k=5):
+    model.eval()
+    total = 0
+    correct1 = 0
+    correctk = 0
+    mse_total = 0.0
+    haversine_sq_total = 0.0
+
+    for seq, lengths, target in loader:
+        seq = seq.to(device)
+        lengths = lengths.to(device)
+        target = target.to(device)
+
+        out = model(x_coords, edge_index, seq, lengths, temporal_features)
+        pred_top1 = out.argmax(dim=1)
+
+        # ---------- Accuracy ----------
+        correct1 += (pred_top1 == target).sum().item()
+
+        topk_indices = torch.topk(out, k, dim=1).indices
+        correctk += sum(target[i] in topk_indices[i] for i in range(len(target)))
+
+        # ---------- MSE ----------
+        pred_coords_scaled = x_coords[pred_top1]
+        true_coords_scaled = x_coords[target]
+        mse_total += F.mse_loss(pred_coords_scaled, true_coords_scaled, reduction='sum').item()
+
+        # ---------- Haversine RMSE ----------
+        # Lookup original GPS coordinates for predicted and target nodes
+        pred_coords = unique_coords.iloc[pred_top1.cpu().numpy()][["GPS_xx", "GPS_yy"]].values
+        true_coords = unique_coords.iloc[target.cpu().numpy()][["GPS_xx", "GPS_yy"]].values
+
+        pred_tensor = torch.as_tensor(pred_coords, device=device, dtype=torch.float)
+        true_tensor = torch.as_tensor(true_coords, device=device, dtype=torch.float)
+
+        haversine_batch = haversine_distance(
+            true_tensor[:, 0], true_tensor[:, 1],
+            pred_tensor[:, 0], pred_tensor[:, 1]
+        )
+        haversine_sq_total += torch.sum(haversine_batch ** 2).item()
+
+        total += len(target)
+
+    # ---------- Aggregate ----------
+    top1 = correct1 / total
+    top5 = correctk / total
+    mse = mse_total / total
+    haversine_rmse = math.sqrt(haversine_sq_total / total)
+
+    return top1, top5, mse, haversine_rmse
+
 # ---------------------------
-# Step 7. Training loop with early stopping
+# Training loop with metric logging
 # ---------------------------
 best_val_loss = float('inf')
 patience = 10
 counter = 0
+num_epochs = 200
 
-for epoch in range(200):
+for epoch in range(num_epochs):
     loss = train_epoch(model, train_loader)
-    top1, top5, mse = evaluate(model, test_loader)
-    print(f"Epoch {epoch+1}: Loss {loss:.4f} | Top-1 {top1:.3f} | Top-5 {top5:.3f} | MSE {mse:.4f}")
+    top1, top5, mse, haversine_rmse = evaluate_with_haversine(model, test_loader)
+    
+    # log metrics
+    history["epoch"].append(epoch + 1)
+    history["top1"].append(top1)
+    history["top5"].append(top5)
+    history["mse"].append(mse)
+    history["haversine_rmse"].append(haversine_rmse)
+
+    print(f"epoch {epoch+1:03d}: loss {loss:.4f} | top-1 {top1:.3f} | top-5 {top5:.3f} | "
+          f"mse {mse:.4f} | haversine RMSE {haversine_rmse:.3f} km")
 
     if loss < best_val_loss:
         best_val_loss = loss
@@ -222,5 +321,46 @@ for epoch in range(200):
     else:
         counter += 1
         if counter >= patience:
-            print("Early stopping triggered")
+            print("early stopping triggered")
             break
+
+
+# ---------------------------
+# Plot Graph 1: Top-1 / Top-5 Accuracy + MSE
+# ---------------------------
+epochs = history["epoch"]
+
+fig, ax1 = plt.subplots(figsize=(10, 6))
+
+# Accuracy on left y-axis
+ax1.set_xlabel("Epoch")
+ax1.set_ylabel("Accuracy (%)")
+ax1.plot(epochs, np.array(history["top1"]) * 100, label="Top-1 Accuracy", color="tab:blue")
+ax1.plot(epochs, np.array(history["top5"]) * 100, label="Top-5 Accuracy", color="tab:orange")
+ax1.tick_params(axis='y')
+ax1.legend(loc="upper left")
+
+# MSE on right y-axis
+ax2 = ax1.twinx()
+ax2.set_ylabel("MSE")
+ax2.plot(epochs, history["mse"], label="MSE", color="tab:green", linestyle="--")
+ax2.tick_params(axis='y', labelcolor="tab:red")
+
+fig.tight_layout()
+plt.title("Top-1 / Top-5 Accuracy and MSE over Epochs")
+out_plot = os.path.join(OUT_DIR, "stgnn_gat_mse_per_iter.png")
+plt.savefig(out_plot, dpi=150, bbox_inches='tight')
+plt.close()
+
+# ---------------------------
+# Plot Graph 2: Haversine RMSE
+# ---------------------------
+plt.figure(figsize=(10, 6))
+plt.plot(epochs, history["haversine_rmse"], marker='o')
+plt.xlabel("Epoch")
+plt.ylabel("Haversine RMSE (km)")
+plt.title("Haversine RMSE over Epochs")
+plt.grid(True)
+out_plot = os.path.join(OUT_DIR, "stgnn_gat_rmse_per_iter.png")
+plt.savefig(out_plot, dpi=150, bbox_inches='tight')
+plt.close()
