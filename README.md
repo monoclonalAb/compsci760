@@ -1,5 +1,7 @@
-# compsci760
-Spatiotemporal Graph Neural Networks for Predicting Migratory Bird Movements and Species Identification Using Historical Trajectory Data
+# STGNNs and other ML models for Migratory Bird Trajectory Prediction and Species Identification
+
+Course: COMPSCI760
+Research Project: Spatiotemporal Graph Neural Networks for Predicting Migratory Bird Movements and Species Identification Using Historical Trajectory Data
 
 ### Installation
 
@@ -37,4 +39,20 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 
 # run the program
 python3 baseline_rnn_birds.py
+```
+
+## Repo Structure
+```
+./data/                                     # contains all the datasets
+./src/preprocessing.py                      # initial preprocessing
+./preprocessing.py                          # second preprocessing
+
+baseline_hyperparameter_optimization.py     # baseline hyperparamter optimization
+baseline_lightgbm_birds.py                  # baseline lightgbm model
+baseline_rnn_birds.py                       # baseline rnn model
+
+stgnn.py                                    # stgnn (GCN version)
+stgnn_gat.py                                # stgnn (GAT version)
+stgnn_gat_validation.py                     # stgnn (GAT version) validation
+stgnn_validation.py                         # stgnn (GCN version) validation
 ```
